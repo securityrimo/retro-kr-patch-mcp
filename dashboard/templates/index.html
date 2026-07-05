@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>번역 검수</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#2a3242;--fg:#e6edf3;--mut:#8b949e;--acc:#5b8cff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--jp:#db6d28}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,'Malgun Gothic',sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
+header{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--line);padding:12px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+h1{font-size:16px;margin:0;color:var(--acc);white-space:nowrap}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{padding:5px 11px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--mut);cursor:pointer;font-size:12.5px}
+.tab.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.tab .c{opacity:.7;margin-left:5px;font-size:11px}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg span{padding:5px 12px;cursor:pointer;color:var(--mut);font-size:12.5px;background:var(--panel2)}
+.seg span.on{background:var(--acc);color:#fff}
+select.mode{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:5px 8px;border-radius:6px;font-size:12.5px}
+input.search{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:6px 10px;border-radius:6px;width:180px}
+button.act{background:var(--acc);color:#fff;border:0;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:600}
+button.act:disabled{opacity:.5;cursor:default}
+.wrap{padding:14px 18px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:var(--mut);font-weight:500;font-size:11.5px;padding:6px 8px;border-bottom:1px solid var(--line);position:sticky;top:57px;background:var(--bg)}
+td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+.off{font-family:ui-monospace,monospace;color:var(--mut);font-size:11.5px;white-space:nowrap}
+.jp{color:#c9d1d9;white-space:pre-wrap;max-width:280px}
+.jp.res{color:var(--jp)}
+td.krc{width:44%}
+.scene{border:1px solid var(--line);border-radius:10px;margin:0 auto 20px;max-width:920px;background:var(--panel);overflow:hidden}
+.scene-h{font-size:11px;color:var(--mut);padding:6px 14px;border-bottom:1px solid var(--line);font-family:ui-monospace,monospace;background:var(--panel2)}
+.speech{display:flex;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.speech:last-child{border-bottom:0}
+.spk{flex:0 0 110px;text-align:right}
+.spk .nm{display:inline-block;background:var(--acc);color:#fff;padding:2px 9px;border-radius:12px;font-weight:700;font-size:13px;max-width:100%}
+.spk .nm.narr{background:var(--line);color:var(--mut)}
+.spk .nmedit{width:100px;margin-top:4px}
+.lines{flex:1;display:flex;flex-direction:column;gap:9px}
+.ln .jpo{color:var(--jp);font-size:11.5px;margin-bottom:2px;white-space:pre-wrap}
+.ln .jpo.plain{color:var(--mut)}
+.kredit{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:6px 8px;border-radius:5px;font-size:15px;font-family:inherit}
+.kredit:focus{outline:1px solid var(--acc);border-color:var(--acc)}
+.kredit.dirty{border-color:var(--warn)}
+.nmedit{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:4px 6px;border-radius:5px;font-size:13px;font-family:inherit}
+.nmedit.dirty{border-color:var(--warn)}
+.meta{display:flex;gap:8px;align-items:center;margin-top:4px;font-size:11px;flex-wrap:wrap}
+.gauge{height:5px;width:90px;background:var(--line);border-radius:3px;overflow:hidden}
+.gauge i{display:block;height:100%;background:var(--ok)}
+.gauge i.over{background:var(--bad)}
+.bytes{color:var(--mut);white-space:nowrap;font-family:ui-monospace,monospace}
+.bytes.over{color:var(--bad)}
+.badge{padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600}
+.b-jp{background:rgba(219,109,40,.18);color:var(--jp)}
+.b-inc{background:rgba(210,153,34,.18);color:var(--warn)}
+.b-man{background:rgba(91,140,255,.18);color:var(--acc)}
+.b-rev{background:rgba(248,81,73,.18);color:var(--bad)}
+.offm{font-family:ui-monospace,monospace;color:var(--mut);font-size:10.5px}
+.tools{display:flex;gap:4px;align-items:center}
+.ins{font-size:11px;padding:2px 6px;border:1px solid var(--line);background:var(--panel2);color:var(--mut);border-radius:4px;cursor:pointer}
+.savebtn{font-size:11px;padding:3px 10px;border:0;border-radius:4px;background:var(--ok);color:#fff;cursor:pointer;opacity:.35}
+.savebtn.on{opacity:1}
+.prev{background:#12203c;border:1px solid var(--line);border-radius:4px;padding:3px;display:none;margin-top:5px}
+.prev.show{display:inline-block}
+.prev img{display:block;image-rendering:pixelated}
+#toast{position:fixed;bottom:18px;right:18px;background:var(--panel);border:1px solid var(--acc);padding:10px 16px;border-radius:8px;max-width:520px;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12px;display:none;z-index:20;box-shadow:0 6px 24px #0008}
+.hint{color:var(--mut);font-size:11px}
+.note{color:var(--mut);font-size:11px;text-align:center;margin:0 auto 14px;max-width:920px}
+/* 장면 목차 */
+.toc{max-width:920px;margin:0 auto 18px;border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+.toc-h{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--panel2);cursor:pointer;font-size:12.5px;color:var(--fg);border-bottom:1px solid var(--line)}
+.toc-h .cnt{color:var(--mut);font-size:11px}
+.toc-h .chev{margin-left:auto;color:var(--mut)}
+.toc.collapsed .toc-list{display:none}
+.toc-list{max-height:260px;overflow-y:auto}
+.toc-item{display:flex;gap:10px;padding:6px 14px;cursor:pointer;border-bottom:1px solid var(--line);font-size:12.5px}
+.toc-item:last-child{border-bottom:0}
+.toc-item:hover{background:var(--panel2)}
+.toc-item .tno{color:var(--mut);font-family:ui-monospace,monospace;font-size:10.5px;flex:0 0 96px}
+.toc-item .tsnip{color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scene{scroll-margin-top:64px}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">번역 검수</h1>
+  <div class="seg" id="view"><span data-v="script" class="on">대본</span><span data-v="table">표</span></div>
+  <select class="mode" id="mode" style="display:none"></select>
+  <div class="tabs" id="tabs"></div>
+  <input class="search" id="q" placeholder="검색 (원문·번역·offset)">
+  <span style="flex:1"></span>
+  <span class="hint" id="stat"></span>
+  <button class="act" id="rebuild" style="display:none">ROM 리빌드</button>
+</header>
+<div class="wrap" id="wrap"></div>
+<div id="toast"></div>
+
+<script>
+const TABS=[['all','전체'],['untranslated','미번역'],['jp_residue','JP 잔류'],['inconsistent','표기 불일치'],['needs_review','재검토'],['manual','수동'],['overbudget','예산초과']];
+const MODE_LABEL={offset:'스토리순 (offset)',pointer:'스토리순 (포인터참조)',file:'추출순 (원본)'};
+let filter='all', view='script', mode='offset', counts={}, CFG={};
+const $=s=>document.querySelector(s), wrap=$('#wrap');
+
+function toast(m,ms=4000){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(t._);t._=setTimeout(()=>t.style.display='none',ms)}
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+
+function renderTabs(){
+  $('#tabs').innerHTML=TABS.map(([k,l])=>
+    `<span class="tab ${k===filter?'on':''}" data-k="${k}">${l}<span class="c">${counts[k]??''}</span></span>`).join('');
+  document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{filter=t.dataset.k;load()});
+}
+
+function editorInner(r,em){
+  const cls=em==='name'?'nmedit':'kredit';
+  let meta='<span class="tools"><span class="ins" data-t="＠">＠</span><span class="ins" data-t="￥">￥</span><span class="ins" data-t="＄">＄</span><span class="ins" data-t="＿">＿</span><button class="savebtn">저장</button></span>';
+  if(CFG.has_budget){
+    const over=!r.fits, pct=r.byte_budget?Math.min(100,Math.round(r.enc_bytes/r.byte_budget*100)):0;
+    meta+=`<div class="gauge"><i class="${over?'over':''}" style="width:${pct}%"></i></div>
+      <span class="bytes ${over?'over':''}">${r.enc_bytes}/${r.byte_budget}</span>`;
+  }
+  const badges=[r.has_jp?'<span class="badge b-jp">JP</span>':'',
+    r.inconsistent?'<span class="badge b-inc">불일치</span>':'',
+    r.needs_review?'<span class="badge b-rev">재검토</span>':'',
+    r.manual?'<span class="badge b-man">수동</span>':''].join('');
+  meta+=`<span class="offm">${r.offset_hex}</span>${badges}`;
+  const prev=CFG.has_preview?'<div class="prev"><img></div>':'';
+  return `<input class="${cls}" value="${esc(r.kr)}"><div class="meta">${meta}</div>${prev}`;
+}
+
+async function preview(el){
+  if(!CFG.has_preview) return;
+  const img=el.querySelector('.prev img'), box=el.querySelector('.prev'), inp=el.querySelector('input');
+  const j=await(await fetch('/api/preview?text='+encodeURIComponent(inp.value))).json();
+  if(j.png){img.src=j.png;box.classList.add('show')}
+}
+
+function wireEl(el,off){
+  const inp=el.querySelector('input'), save=el.querySelector('.savebtn'), bytes=el.querySelector('.bytes');
+  let previewed=false;
+  const lazyPrev=()=>{clearTimeout(inp._);inp._=setTimeout(()=>preview(el),320)};
+  inp.onfocus=()=>{if(!previewed){previewed=true;preview(el)}};
+  inp.oninput=()=>{inp.classList.add('dirty');save.classList.add('on');previewed=true;lazyPrev()};
+  el.querySelectorAll('.ins').forEach(b=>b.onclick=()=>{
+    const p=inp.selectionStart??inp.value.length;
+    inp.value=inp.value.slice(0,p)+b.dataset.t+inp.value.slice(p);
+    inp.dispatchEvent(new Event('input'));inp.focus();
+  });
+  const doSave=async(force)=>{
+    const j=await(await fetch('/api/string',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({offset_hex:off,kr:inp.value,force})})).json();
+    if(!j.ok){
+      if(confirm(j.err+'\n\n그래도 강제 저장할까요? (예산초과분은 빌드시 스킵)')) return doSave(true);
+      return;
+    }
+    inp.classList.remove('dirty');save.classList.remove('on');
+    if(bytes) bytes.textContent=j.enc_bytes+'/'+bytes.textContent.split('/')[1];
+    toast('저장됨: '+off,1200);
+  };
+  save.onclick=()=>doSave(false);
+  inp.onkeydown=e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter')doSave(false)};
+}
+
+/* ── 표 뷰 ── */
+function renderTable(rows){
+  wrap.innerHTML=`<table><thead><tr><th>offset</th><th>원문</th><th>번역 (편집)</th></tr></thead><tbody id="tb"></tbody></table>`;
+  const tb=$('#tb');
+  tb.innerHTML=rows.map(r=>`<tr data-off="${r.offset_hex}">
+    <td class="off">${r.offset_hex}</td>
+    <td class="jp ${r.jp_src?'res':''}">${esc(r.jp)}</td>
+    <td class="krc">${editorInner(r,'big')}</td></tr>`).join('');
+  tb.querySelectorAll('tr').forEach(tr=>wireEl(tr,tr.dataset.off));
+}
+
+/* ── 대본 뷰 (서버 /api/scenes: 재정렬+장면그룹, 화자별 묶음) ── */
+function speechOf(rows){
+  // scene 안에서 화자(is_name)+본문 묶기
+  let html='', cur=null;
+  const flush=()=>{if(cur){html+=cur+'</div></div>';cur=null}};
+  rows.forEach(r=>{
+    if(r.is_name){
+      flush();
+      cur=`<div class="speech"><div class="spk">
+        <span class="nm">${esc(r.kr.replace(/[＠￥＄＊＿]/g,''))||'?'}</span>
+        <div class="ln nmln" data-off="${r.offset_hex}">${editorInner(r,'name')}</div>
+      </div><div class="lines">`;
+    }else{
+      const line=`<div class="ln" data-off="${r.offset_hex}">
+        <div class="jpo ${r.jp_src?'':'plain'}">${esc(r.jp)}</div>${editorInner(r,'big')}</div>`;
+      if(cur){cur+=line}
+      else{cur=`<div class="speech"><div class="spk"><span class="nm narr">지문</span></div><div class="lines">`+line}
+    }
+  });
+  flush();
+  return html;
+}
+// 장면 대표 스니펫: 첫 화자 또는 첫 본문 한 줄
+function sceneLabel(sc){
+  const nm=sc.rows.find(r=>r.is_name);
+  const speaker=nm?nm.kr.replace(/[＠￥＄＊＿]/g,''):'';
+  const body=sc.rows.find(r=>!r.is_name && (r.kr||r.jp));
+  const line=body?(body.kr||body.jp).replace(/[＠￥＄＊＿&]/g,'').replace(/[x+\-][0-3]/g,'').trim():'';
+  return (speaker?`〔${speaker}〕 `:'')+line;
+}
+function renderScenes(scenes,note){
+  let html=note?`<p class="note">${esc(note)}</p>`:'';
+  // 목차
+  const items=scenes.map((sc,i)=>`<div class="toc-item" data-i="${i}">
+    <span class="tno">${i+1}. ${sc.start}</span>
+    <span class="tsnip">${esc(sceneLabel(sc))||'—'}</span></div>`).join('');
+  html+=`<div class="toc" id="toc"><div class="toc-h" id="tocH">📖 장면 목차<span class="cnt">${scenes.length}개</span><span class="chev">▾</span></div>
+    <div class="toc-list">${items}</div></div>`;
+  // 본문
+  scenes.forEach((sc,i)=>{
+    html+=`<div class="scene" id="sc${i}"><div class="scene-h">장면 ${i+1} · ${sc.start}</div>${speechOf(sc.rows)}</div>`;
+  });
+  wrap.innerHTML=html||'<p class="hint">결과 없음</p>';
+  wrap.querySelectorAll('.ln').forEach(el=>wireEl(el,el.dataset.off));
+  const toc=$('#toc');
+  $('#tocH').onclick=()=>toc.classList.toggle('collapsed');
+  wrap.querySelectorAll('.toc-item').forEach(it=>it.onclick=()=>{
+    const el=$('#sc'+it.dataset.i);
+    if(el){el.scrollIntoView({behavior:'smooth',block:'start'});el.style.transition='box-shadow .2s';el.style.boxShadow='0 0 0 2px var(--acc)';setTimeout(()=>el.style.boxShadow='',1200)}
+  });
+}
+
+async function loadScript(){
+  const j=await(await fetch(`/api/scenes?mode=${mode}&filter=${filter}&q=${encodeURIComponent($('#q').value)}`)).json();
+  let n=0; j.scenes.forEach(s=>n+=s.rows.filter(r=>!r.is_name).length);
+  $('#stat').textContent=`${n} 문자열 · ${j.scenes.length} 장면`;
+  renderScenes(j.scenes,j.note);
+}
+async function loadTable(){
+  const j=await(await fetch(`/api/strings?filter=${filter}&q=${encodeURIComponent($('#q').value)}`)).json();
+  $('#stat').textContent=`${j.count} / 전체 ${j.total}`;
+  renderTable(j.rows);
+}
+function load(){renderTabs();(view==='script'?loadScript:loadTable)()}
+
+async function loadCounts(){
+  for(const [k] of TABS){
+    const j=await(await fetch(`/api/strings?filter=${k}`)).json();
+    counts[k]=j.count;
+  }
+  renderTabs();
+}
+
+document.querySelectorAll('#view span').forEach(s=>s.onclick=()=>{
+  view=s.dataset.v;
+  document.querySelectorAll('#view span').forEach(x=>x.classList.toggle('on',x.dataset.v===view));
+  $('#mode').style.display=(view==='script'&&CFG.story_modes.length>1)?'':'none';
+  load();
+});
+let deb;
+$('#q').oninput=()=>{clearTimeout(deb);deb=setTimeout(load,300)};
+$('#mode').onchange=e=>{mode=e.target.value;load()};
+$('#rebuild').onclick=async()=>{
+  const b=$('#rebuild');b.disabled=true;b.textContent='빌드 중…';
+  const j=await(await fetch('/api/rebuild',{method:'POST'})).json();
+  toast((j.ok?'✅ 빌드 성공\n':'❌ 빌드 실패\n')+(j.out||'')+(j.err||''),12000);
+  b.disabled=false;b.textContent='ROM 리빌드';loadCounts();
+};
+
+(async()=>{
+  CFG=await(await fetch('/api/config')).json();
+  document.title=(CFG.name||'')+' 번역 검수';
+  $('#title').textContent=(CFG.name||'')+' 검수';
+  mode=CFG.default_mode||'offset';
+  if(!CFG.story_modes.includes(mode)) mode=CFG.story_modes[0];
+  $('#mode').innerHTML=CFG.story_modes.map(m=>`<option value="${m}" ${m===mode?'selected':''}>${MODE_LABEL[m]||m}</option>`).join('');
+  if(CFG.story_modes.length>1) $('#mode').style.display='';
+  if(CFG.can_rebuild) $('#rebuild').style.display='';
+  load();loadCounts();
+})();
+</script>
+</body>
+</html>

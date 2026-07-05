@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.bak*
+checkpoints/
+output/
+*.log
+.env*
+*.gba
+*.ss*
+*.sav
