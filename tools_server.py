@@ -2499,5 +2499,352 @@ def gfx_build(project_dir: str, action: str = "manifest", chain: str = "",
                     "(manifest|region|status|report|deploy)")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 폰트 베이스 검증 · 커버리지 갭 · 글리프 시프트 진단 · 예산 주입
+# (2026-07-06 Hikaru2 프로젝트 교훈 도구화 — 저능력 에이전트도 순서 호출만으로 수행 가능)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fv_read_table(rom: bytes, table_offset: int, table_entries: int) -> list:
+    """(u16 sjis, u16 glyph_idx) 정렬 테이블 파싱"""
+    import struct
+    return [struct.unpack("<HH", rom[table_offset + k*4: table_offset + k*4 + 4])
+            for k in range(table_entries)]
+
+
+def _fv_glyph_png(rom: bytes, base: int, gi: int, w: int, h: int, bpp: int,
+                  bytes_per_glyph: int, scale: int = 8):
+    """글리프 1개를 PIL 이미지로 (4bpp 니블=픽셀 농도, 2bpp/1bpp packed)"""
+    from PIL import Image
+    g = rom[base + gi*bytes_per_glyph: base + (gi+1)*bytes_per_glyph]
+    img = Image.new("L", (w, h), 0)
+    px = img.load()
+    if bpp == 4:
+        bpr = (w + 1) // 2
+        for y in range(h):
+            for x in range(w):
+                b = g[y*bpr + x//2] if y*bpr + x//2 < len(g) else 0
+                v = (b & 0xF) if x % 2 == 0 else (b >> 4)
+                px[x, y] = min(255, v * 85)
+    elif bpp == 2:
+        bpr = (w + 3) // 4
+        for y in range(h):
+            for x in range(w):
+                b = g[y*bpr + x//4] if y*bpr + x//4 < len(g) else 0
+                v = (b >> ((x % 4) * 2)) & 3
+                px[x, y] = v * 85
+    else:  # 1bpp
+        bpr = (w + 7) // 8
+        for y in range(h):
+            for x in range(w):
+                b = g[y*bpr + x//8] if y*bpr + x//8 < len(g) else 0
+                px[x, y] = 255 if (b >> (7 - x % 8)) & 1 else 0
+    return img.resize((w*scale, h*scale), Image.NEAREST)
+
+
+@mcp.tool()
+def font_base_probe(rom_path: str, table_offset: str, table_entries: int,
+                    glyph_base: str, test_chars: str = "早碁局",
+                    shifts: str = "-256,-223,-128,-64,0,64,128,223,256",
+                    width: int = 12, height: int = 12, bpp: int = 4,
+                    bytes_per_glyph: int = 0, out_name: str = "font_probe") -> str:
+    """폰트 베이스/글리프 시프트 검증 시트 생성.
+
+    ⚠ 정적 RE로 찾은 글리프 베이스는 시프트가 어긋나 있을 수 있다(Hikaru2에서 +223 실측).
+    반드시 이 도구로 화면과 대조 검증 후 주입할 것.
+
+    test_chars의 각 문자를 SJIS→gi 테이블로 조회한 뒤, 후보 시프트별로
+    font[gi+shift] 글리프를 렌더한 대조 시트 PNG를 만든다.
+    → 에이전트는 시트에서 test_chars와 모양이 일치하는 행(shift)을 찾아
+      실효 베이스 = glyph_base + shift*bytes_per_glyph 로 확정한다.
+    자동판정 불가 시 게임 화면 스크린샷(emucap screenshot)과 비교하라.
+    """
+    import bisect
+    from PIL import Image
+    try:
+        rom = _read_rom(rom_path)
+        toff = int(table_offset, 0)
+        gbase = int(glyph_base, 0)
+        if bytes_per_glyph <= 0:
+            bytes_per_glyph = (width * bpp + 7) // 8 * height
+        entries = _fv_read_table(rom, toff, table_entries)
+        codes = [c for c, _ in entries]
+
+        def gi_of(ch):
+            try:
+                enc = ch.encode("cp932")
+            except Exception:
+                return None
+            if len(enc) != 2:
+                return None
+            sj = (enc[0] << 8) | enc[1]
+            k = bisect.bisect_left(codes, sj)
+            return entries[k][1] if k < len(codes) and codes[k] == sj else None
+
+        shift_list = [int(s) for s in shifts.split(",")]
+        chars = [(ch, gi_of(ch)) for ch in test_chars if gi_of(ch) is not None]
+        if not chars:
+            return json.dumps({"error": "test_chars 중 테이블에 있는 문자가 없음"},
+                              ensure_ascii=False)
+
+        cell = max(width, height) * 8 + 8
+        sheet = Image.new("L", (cell * len(chars) + 80, cell * len(shift_list)), 32)
+        rows = []
+        max_gi_pos = (len(rom) - gbase) // bytes_per_glyph
+        for r, sh in enumerate(shift_list):
+            row_info = {"shift": sh,
+                        "effective_base": hex(gbase + sh * bytes_per_glyph), "chars": {}}
+            for c, (ch, gi) in enumerate(chars):
+                gi2 = gi + sh
+                if 0 <= gi2 < max_gi_pos:
+                    im = _fv_glyph_png(rom, gbase, gi2, width, height, bpp, bytes_per_glyph)
+                    sheet.paste(im, (80 + c * cell + 4, r * cell + 4))
+                    row_info["chars"][ch] = {"gi": gi, "gi_shifted": gi2}
+            rows.append(row_info)
+        out = OUTPUT_DIR / f"{out_name}.png"
+        sheet.save(out)
+        return json.dumps({
+            "sheet": str(out), "row_order_shifts": shift_list, "chars": test_chars,
+            "next_action": "시트를 Read로 열어 각 행을 보고, test_chars 모양과 일치하는 "
+                           "행의 shift를 채택. effective_base를 주입 도구에 사용. "
+                           "일치 행이 없으면 shifts를 좁혀 재호출(예: '200,210,220,230,240').",
+            "rows": rows,
+        }, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def coverage_gap_scan(original_rom: str, patched_rom: str,
+                      region_start: str, region_end: str,
+                      min_jp_chars: int = 2, out_name: str = "coverage_gaps") -> str:
+    """번역 커버리지 갭 스캔 — 패치롬에서 원본과 동일하게 남은(=미번역) 일본어 세그먼트 열거.
+
+    ⚠ 문자열 추출기가 제어코드/이름코드(①② 등)를 경계로 오인해 문장 앞부분이
+    통째로 누락되는 사고가 흔하다(Hikaru2에서 616조각). 주입 후 반드시 이 도구로
+    잔존 일본어를 전수 확인할 것.
+
+    null-종단 세그먼트 단위로 걷고, 각 세그먼트에서 원본과 첫 diff 위치까지를
+    '미번역 접두부(budget)'로 마킹한다. 결과 JSON은 inject_budgeted_text 입력과 호환.
+    """
+    try:
+        orig = _read_rom(original_rom)
+        pat = _read_rom(patched_rom)
+        rs, re_ = int(region_start, 0), int(region_end, 0)
+        items = []
+        i = rs
+        while i < re_:
+            if pat[i] == 0:
+                i += 1
+                continue
+            st = i
+            while i < re_ and pat[i] != 0:
+                i += 1
+            seg_p, seg_o = pat[st:i], orig[st:i]
+            diff = next((k for k in range(len(seg_p)) if seg_p[k] != seg_o[k]), None)
+            untr = seg_o[:diff] if diff is not None else seg_o
+            try:
+                jp = untr.decode("cp932", errors="replace")
+            except Exception:
+                continue
+            kana = sum(1 for c in jp if '぀' <= c <= 'ヿ')
+            kanji = sum(1 for c in jp if '一' <= c <= '鿿')
+            ctrl = sum(1 for c in jp if ord(c) < 0x20 or 0xE000 <= ord(c) <= 0xF8FF)
+            if kana + kanji >= min_jp_chars and ctrl == 0:
+                items.append({
+                    "file_off": st, "byte_len": len(seg_p),
+                    "budget": diff if diff is not None else len(seg_p),
+                    "jp_untranslated": jp,
+                    "jp_full_orig": seg_o.split(b"\x00")[0].decode("cp932", errors="replace"),
+                    "kind": "prefix" if diff is not None else "full",
+                })
+        out = OUTPUT_DIR / f"{out_name}.json"
+        out.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+        return json.dumps({
+            "gaps": len(items), "total_bytes": sum(x["budget"] for x in items),
+            "saved": str(out),
+            "next_action": "0건이면 커버리지 완전. 있으면 jp_untranslated를 번역해 "
+                           "items에 'ko' 필드를 채우고 inject_budgeted_text로 주입. "
+                           "번역 시 이름코드(①②)·줄바꿈(↓)·숫자코드(③~⑥)는 그대로 보존.",
+            "sample": items[:5],
+        }, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def diagnose_glyph_shift(rom_path: str, table_offset: str, table_entries: int,
+                         host_map_json: str, expected_text: str,
+                         observed_text: str) -> str:
+    """화면 깨짐 진단 — 기대 문장 vs 화면에 보인 글자의 글리프 인덱스 차이를 계산.
+
+    주입 후 화면에 엉뚱한 한글/한자가 나올 때 사용. 기대 문장의 각 음절 gi와
+    화면에 보인 각 글자(주입 음절이면 그 gi)의 위치별 차이가 '상수'면
+    렌더러의 글리프 베이스가 그만큼 어긋난 것이다(Hikaru2 +223 사례).
+    → 확정되면 font_base_probe로 검증 후 글리프를 shift 반영 위치에 재주입.
+    관측 글자가 주입 음절이 아니면(원본 한자 등) delta가 null로 나온다.
+    """
+    import bisect
+    try:
+        rom = _read_rom(rom_path)
+        toff = int(table_offset, 0)
+        entries = _fv_read_table(rom, toff, table_entries)
+        codes = [c for c, _ in entries]
+
+        def sidx(sj):
+            k = bisect.bisect_left(codes, sj)
+            return entries[k][1] if k < len(codes) and codes[k] == sj else None
+
+        host_map = {k: int(v) for k, v in
+                    json.loads(Path(host_map_json).read_text(encoding="utf-8")).items()}
+        exp = [(ch, sidx(host_map[ch])) for ch in expected_text if ch in host_map]
+        obs = [(ch, sidx(host_map[ch]) if ch in host_map else None)
+               for ch in observed_text if not ch.isspace()]
+        deltas = []
+        for k in range(min(len(exp), len(obs))):
+            e_gi, o_gi = exp[k][1], obs[k][1]
+            deltas.append({"pos": k, "expected": exp[k][0], "observed": obs[k][0],
+                           "delta": (o_gi - e_gi) if (e_gi is not None and o_gi is not None)
+                           else None})
+        vals = [d["delta"] for d in deltas if d["delta"] is not None]
+        const = bool(vals) and all(v == vals[0] for v in vals)
+        return json.dumps({
+            "constant_shift": vals[0] if const else None,
+            "verdict": (f"렌더러 글리프 시프트 = {vals[0]:+d} 확정. "
+                        "font_base_probe로 검증 후 글리프 주입 베이스를 "
+                        f"{vals[0]:+d} 글리프만큼 이동하라." if const else
+                        "상수 시프트 아님 — 인코딩 어긋남이나 다른 폰트/테이블 사용 가능성. "
+                        "coverage_gap_scan과 원문 대조를 먼저 하라."),
+            "deltas": deltas,
+        }, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def inject_budgeted_text(rom_path: str, items_json: str, host_map_json: str,
+                         table_offset: str, table_entries: int, glyph_base: str,
+                         ttf_path: str, out_path: str = "",
+                         width: int = 12, height: int = 12, bpp: int = 4,
+                         bytes_per_glyph: int = 0, min_host_gi: int = 300,
+                         pad_byte: str = "0x20") -> str:
+    """예산 내 in-place 한글 주입 (신규 음절 글리프 자동 렌더 포함).
+
+    items_json: [{file_off, budget, ko}] 배열 파일. ko의 한글 음절은 host_map으로
+    인코딩하고, host_map에 없는 신규 음절은 미사용 슬롯(gi>=min_host_gi,
+    기존 host 미사용 sjis)에 TTF 렌더로 글리프를 만들어 자동 등록한다.
+    glyph_base는 반드시 font_base_probe로 검증한 '실효 베이스'를 줄 것.
+    예산 초과 시 공백 제거 → 문자 경계 절단, 잔여는 pad_byte로 패딩.
+    host_map_json 파일은 신규 음절이 추가된 상태로 갱신 저장된다.
+    """
+    import bisect, shutil
+    from PIL import Image, ImageFont, ImageDraw
+    try:
+        rom = bytearray(_read_rom(rom_path))
+        toff = int(table_offset, 0)
+        gbase = int(glyph_base, 0)
+        pad = int(pad_byte, 0)
+        if bytes_per_glyph <= 0:
+            bytes_per_glyph = (width * bpp + 7) // 8 * height
+        entries = _fv_read_table(bytes(rom), toff, table_entries)
+
+        hm_path = Path(host_map_json)
+        host_map = {k: int(v) for k, v in
+                    json.loads(hm_path.read_text(encoding="utf-8")).items()}
+        items = json.loads(Path(items_json).read_text(encoding="utf-8"))
+
+        # 신규 음절 → 미사용 슬롯 + TTF 글리프
+        need = sorted({ch for it in items for ch in it.get("ko", "")
+                       if '가' <= ch <= '힣' and ch not in host_map})
+        used = set(host_map.values())
+        free = [(c, gi) for c, gi in entries if gi >= min_host_gi and c not in used]
+        if len(need) > len(free):
+            return json.dumps({"error": f"슬롯 부족: 신규 {len(need)} > 여유 {len(free)}"},
+                              ensure_ascii=False)
+        if bpp != 4:
+            return json.dumps({"error": "글리프 자동 렌더는 4bpp만 지원"}, ensure_ascii=False)
+        font = ImageFont.truetype(ttf_path, max(width, height))
+
+        def render_glyph(ch):
+            tmp = Image.new("L", (16, 16), 0)
+            d = ImageDraw.Draw(tmp)
+            bb = font.getbbox(ch)
+            ox = (width - (bb[2]-bb[0])) // 2 - bb[0]
+            oy = (height - (bb[3]-bb[1])) // 2 - bb[1]
+            d.text((ox, oy), ch, font=font, fill=255)
+            img = tmp.crop((0, 0, width, height))
+            px = img.load()
+            out = bytearray(bytes_per_glyph)
+            bpr = (width + 1) // 2
+            for y in range(height):
+                for xb in range(bpr):
+                    lo = min(3, px[xb*2, y]*3//255)
+                    hi = min(3, px[xb*2+1, y]*3//255) if xb*2+1 < width else 0
+                    out[y*bpr+xb] = (lo & 0xF) | ((hi & 0xF) << 4)
+            return bytes(out)
+
+        glyphs_new = 0
+        for i, ch in enumerate(need):
+            sj, gi = free[i]
+            host_map[ch] = sj
+            rom[gbase + gi*bytes_per_glyph: gbase + (gi+1)*bytes_per_glyph] = render_glyph(ch)
+            glyphs_new += 1
+
+        def enc(text):
+            out = bytearray()
+            for ch in text:
+                if ch in host_map:
+                    sj = host_map[ch]
+                    out += bytes([(sj >> 8) & 0xFF, sj & 0xFF])
+                elif ord(ch) < 0x80:
+                    out.append(ord(ch))
+                else:
+                    try:
+                        out += ch.encode("cp932")
+                    except Exception:
+                        out.append(0x3F)
+            return bytes(out)
+
+        done = trimmed = truncated = skipped = 0
+        for it in items:
+            ko = it.get("ko", "")
+            if not ko:
+                skipped += 1
+                continue
+            off, budget = it["file_off"], it["budget"]
+            e = enc(ko)
+            if len(e) > budget:
+                e = enc(ko.replace(" ", ""))
+                if len(e) <= budget:
+                    trimmed += 1
+                else:
+                    cut = bytearray()
+                    for ch in ko.replace(" ", ""):
+                        ce = enc(ch)
+                        if len(cut) + len(ce) > budget:
+                            break
+                        cut += ce
+                    e = bytes(cut)
+                    truncated += 1
+            rom[off:off+len(e)] = e
+            for k in range(off+len(e), off+budget):
+                rom[k] = pad
+            done += 1
+
+        op = Path(out_path) if out_path else Path(rom_path)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if op.exists():
+            shutil.copy2(op, f"{op}.bak-{ts}")
+        op.write_bytes(bytes(rom))
+        hm_path.write_text(json.dumps(host_map, ensure_ascii=False), encoding="utf-8")
+        return json.dumps({
+            "injected": done, "skipped_no_ko": skipped, "space_trimmed": trimmed,
+            "truncated": truncated, "new_glyphs": glyphs_new, "out": str(op),
+            "next_action": "에뮬(emucap launch→tap→screenshot)로 해당 장면을 열어 "
+                           "화면 실측 검증. 깨지면 diagnose_glyph_shift 실행.",
+        }, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     mcp.run()
