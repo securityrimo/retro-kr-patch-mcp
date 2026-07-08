@@ -79,8 +79,13 @@ def max_chars(jp, budget):
     reserve = 2 if jp.endswith('＠') else 0
     return max(1, (budget - reserve) // 2)
 
-def chat(messages, temp=0.3, max_tokens=1800):
-    body = json.dumps({'model': 'deepseek-chat', 'messages': messages,
+# 스테이지별 모델 분배 — 글로서리(세계지식)·라벨(축약판단)은 상위, 초벌·자수교정은 경량 가능
+_MODEL_DEFAULT = os.environ.get('KRPATCH_MODEL_DEFAULT', 'deepseek-chat')
+def _model_for(stage):
+    return os.environ.get(f'KRPATCH_MODEL_{stage.upper()}', _MODEL_DEFAULT)
+
+def chat(messages, temp=0.3, max_tokens=1800, stage='draft'):
+    body = json.dumps({'model': _model_for(stage), 'messages': messages,
                        'temperature': temp, 'max_tokens': max_tokens}).encode()
     req = urllib.request.Request(API, data=body, headers={
         'Content-Type': 'application/json', 'Authorization': f'Bearer {KEY}'})
@@ -118,7 +123,8 @@ def build_glossary(ctx, game=None, force=False):
         '한자·가나 금지 순한글, ？？？류 제외, 확신없으면 제외. '
         'JSON만: {"names":{"<JP>":"<KR>"},"terms":{"<JP>":"<KR>"}}')
     usr = f'게임:『{game}』\nROM 실제 이름표(빈도순):\n{json.dumps(labels, ensure_ascii=False)}'
-    m = _loads_lenient(chat([{'role': 'system', 'content': sysmsg}, {'role': 'user', 'content': usr}]))
+    m = _loads_lenient(chat([{'role': 'system', 'content': sysmsg}, {'role': 'user', 'content': usr}],
+                            stage='glossary'))
     m = m[0] if isinstance(m, list) and m else (m if isinstance(m, dict) else {})
     names = {k: v for k, v in m.get('names', {}).items() if v and k}
     terms = {k: v for k, v in m.get('terms', {}).items() if v and k}
@@ -168,7 +174,8 @@ def resolve_labels(ctx):
                   '임의축약이면 sure=false. JSON배열만: [{"jp":..,"kr":..,"sure":bool,"reason":..}]')
         usr = (f'게임:『{gl.get("game","")}』\n확정명 참고:{json.dumps(dict(list(names.items())[:30]), ensure_ascii=False)}\n'
                f'해석대상:\n{json.dumps(need, ensure_ascii=False)}')
-        for it in _loads_lenient(chat([{'role': 'system', 'content': sysmsg}, {'role': 'user', 'content': usr}], max_tokens=4000)):
+        for it in _loads_lenient(chat([{'role': 'system', 'content': sysmsg}, {'role': 'user', 'content': usr}],
+                                      max_tokens=4000, stage='labels')):
             jp, kr, sure = it.get('jp'), (it.get('kr') or '').strip(), it.get('sure')
             mc = budget.get(jp, 3)
             if kr and len(kr) <= mc and sure:
@@ -200,7 +207,8 @@ def stage_a(ctx, window, names, gtext):
               '각 줄 max 글자수 이하(넘치면 짧게 의역). JSON배열만: [{"id":"<offset_hex>","kr":".."}]')
     payload = [{'id': s['offset_hex'], 'jp': s['jp'], 'max': s['byte_budget'] // 2} for s in window]
     arr = _loads_lenient(chat([{'role': 'system', 'content': sysmsg},
-                               {'role': 'user', 'content': '장면(줄순서=대사순서):\n' + json.dumps(payload, ensure_ascii=False)}]))
+                               {'role': 'user', 'content': '장면(줄순서=대사순서):\n' + json.dumps(payload, ensure_ascii=False)}],
+                              stage='draft'))
     return {d['id']: d['kr'] for d in arr if isinstance(d, dict) and 'id' in d}
 
 def pin_names(ctx, window, draft, names, name_seen):
@@ -236,7 +244,7 @@ def stage_b(ctx, jp, kr, budget, src_ctrl):
             fb.append(f'제어토큰 원문={src_ctrl} 위치·개수 맞출 것')
         kr = chat([{'role': 'system', 'content': sysmsg},
                    {'role': 'user', 'content': f'원문:{jp}\n현재:{kr}\n최대 {budget // 2}자.\n' + '. '.join(fb) + '. 번역문만'}],
-                  temp=0.4, max_tokens=200).splitlines()[-1].strip().strip('"「」')
+                  temp=0.4, max_tokens=200, stage='refine').splitlines()[-1].strip().strip('"「」')
     n, bad = ctx.enc_len(kr)
     ok = n <= budget and not bad and ctx.ms(kr) == src_ctrl
     return kr, ok, (None if ok else 'budget/char/ctrl')
