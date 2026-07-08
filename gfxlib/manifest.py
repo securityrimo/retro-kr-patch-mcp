@@ -135,6 +135,13 @@ def _validate_step(step, where, errors):
                 step["_rom_base"] = parse_int(step["rom_base"])
             except ValueError as ex:
                 errors.append(f"{where}.rom_base: {ex}")
+        # 선택: 압축블록(LZ77/RLE) 오프셋 — 지정 시 rom_base 는 해제버퍼 내
+        # 타일0 기준 오프셋(locate_compressed 의 base)
+        if step.get("comp_off") is not None:
+            try:
+                step["_comp_off"] = parse_int(step["comp_off"])
+            except ValueError as ex:
+                errors.append(f"{where}.comp_off: {ex}")
         items = step.get("items")
         if not isinstance(items, list) or not items:
             errors.append(f"{where}: regions 스텝의 items 는 비어있지 않은 리스트여야 함")

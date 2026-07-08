@@ -17,6 +17,7 @@
 | `redraw.py` | rect 엔진 + locate + 플러그인 로더 | redraw_region/locate_bg |
 | `manifest.py` | krpatch.gfx.json 로더/검증/치환 | 신규 (dashboard/project.py 패턴) |
 | `runner.py` | 체인 실행 + 게이트 G1~G5 + run report | build_ui.sh 시맨틱 |
+| `compress.py` | GBA BIOS LZ77/RLE 코덱 + 압축블록 스캔/역탐색 | 신규 (2026-07-08 gfx v2) |
 
 ## 공통 규약
 
@@ -95,12 +96,43 @@ def locate(frame: dict, bg: int, rom: bytes) -> dict   # {"base":int|None,"ok":i
 def redraw_rect(rom: bytearray, frame: dict, bg: int, base: int, rect: tuple, text: str, *,
                 font_path: str, hi=None, fill=None, dark=None, ol=None, excl: tuple = None,
                 margin: float = 0.86, preview_path: str = None, dry_run: bool = False) -> dict
-    # redraw_region.py와 비트 동일. rom(누적 bytearray)을 in-place 수정(원본은 baseROM 파일 → 여기선 전달 바이트).
+    # redraw_region.py와 비트 동일(4bpp 경로 md5 회귀 확인). rom(누적 bytearray)을 in-place 수정.
     # 팔레트 히스토그램은 rom 바이트에서 계산(원본과 동일 시맨틱). hi/fill/dark/ol=None이면 자동판정.
-    # 리턴: {"ok","cells","tiles","conflicts","palno","chosen":{"hi","fill","dark","ol"},"px","preview"}
+    # 2026-07-08: BGnCNT bpp8 자동감지 — 8bpp(64B/타일, 256색 단일뱅크)도 native 지원.
+    #   타일 off<0 또는 rom 범위 밖이면 ValueError(음수 base 안전장치).
+    # 리턴: {"ok","cells","tiles","conflicts","palno","bpp8","chosen":{...},"px","preview"}
+def redraw_rect_compressed(rom, frame, bg, comp_off, base, rect, text, *, ...같은 kwargs...,
+                           vram_safe=True) -> dict
+    # LZ77/RLE 블록 재작화: 해제 → redraw_rect(해제버퍼를 rom 역할로) → 재압축 in-place.
+    # base = 해제버퍼 내 타일0 기준 오프셋(locate_compressed 반환). 예산 = 기존 슬롯(4정렬).
+    # 초과 시 rom 미수정 + ok=False + compress:{need,budget}. dry_run이면 재압축 생략.
+    # 불변식: 압축경로 산출(해제 후) == 무압축 rect 엔진 산출 (비트 동일, 테스트 6)
 def load_plugin(path: str):   # spec_from_file_location, PLUGIN_API==1 확인
     # 플러그인: def apply(rom: bytearray, frames: dict, params: dict, *, preview_dir, dry_run) -> dict
 ```
+
+## compress.py (2026-07-08 gfx v2)
+
+```python
+def lz77_decompress(data, off=0) -> (bytes, comp_size)   # GBA BIOS 0x10, strict(경계·disp 검증)
+def rle_decompress(data, off=0) -> (bytes, comp_size)    # GBA BIOS 0x30
+def decompress(data, off=0) -> (bytes, comp_size, kind)  # 헤더 자동판별
+def lz77_compress(raw, vram_safe=True) -> bytes
+    # optimal parse(DP, lit=9bit/match=17bit) — in-place 슬롯 예산 최대화.
+    # vram_safe=True → disp>=2 (LZ77UnCompVram 16비트 기록 안전). 4바이트 정렬 패딩.
+def rle_compress(raw) -> bytes
+def scan_blocks(rom, kinds=("lz77","rle"), min_size=0x20, max_size=0x20000,
+                align=4, limit=0) -> [{"off","kind","comp_size","decomp_size"}]
+    # 16MB ROM 전수 ~0.5s. strict 해제 성공만 채택.
+def locate_compressed(frame, bg, rom, plat=None, blocks=None) -> dict
+    # locate의 압축판 — 압축블록들을 해제해 BG 사용 타일 교차검증(동일 확정 기준).
+    # 반환 base = "해제버퍼 내" 타일0 기준 오프셋(음수 가능).
+def patch_compressed(rom: bytearray, comp_off, new_raw, kind="lz77", vram_safe=True) -> dict
+    # 재압축 → 라운드트립 자가검증 → 슬롯 내면 in-place(여분 0패딩), 초과면 미기록.
+```
+
+자가검증: 라운드트립 비트동일(7케이스×lz77 vs/nvs×rle), disp>=2 전수 파스,
+합성 ROM planted 블록 전수 탐지 — tests/test_gfx_compress.py.
 
 자가검증(필수): v1.2 사본에 `redraw_rect(..., rect=(1,4,10,6), text="난이도", hi=6, fill=5, dark=3, ol=1)`
 → 원본 `HI=6 FILL=5 DARK=3 OL=1 python3 redraw_region.py dump_options 1 0x179cc0 "1,4,10,6" "난이도" <out> <v1.2>` 출력과 **md5 동일**.
@@ -117,6 +149,10 @@ def load_plugin(path: str):   # spec_from_file_location, PLUGIN_API==1 확인
     "items":[{"rect":"1,4,10,6","text":"난이도","hi":6,"fill":5,"dark":3,"ol":1,"excl":null}]}]}}}
 ```
 
+regions 스텝 선택 키 `comp_off`(2026-07-08): "0x.." — LZ77/RLE 압축블록 오프셋.
+지정 시 `rom_base`는 해제버퍼 내 타일0 기준 오프셋(locate_compressed의 base)이며,
+runner가 "1회 해제 → 아이템 N개 rect → 1회 재압축(예산=기존 슬롯)"으로 실행한다.
+
 ```python
 def load_gfx_config(project_root: str) -> dict    # 검증 + _abs 경로 주입 + 오류 리스트({"errors":[...]})
 def resolve_frames(cfg, project_root, screen) -> str   # legacy_frames 우선, 아니면 .krpatch/gfx/frames/<screen>
@@ -131,6 +167,7 @@ def run_chain(project_root: str, cfg: dict, chain: str, version: str, *, steps: 
 - acc = bytearray(base 파일). artifact→교체, regions→아이템 순차 redraw_rect(**acc 바이트에서 팔레트 hist 재계산 — build_ui.sh 서브프로세스 체인과 시맨틱 동일**), cmd→acc를 로컬 임시파일로 실체화(`tempfile.mkdtemp(prefix="krgfx-")`, NAS 아님)→argv의 {acc}/{next} 치환 실행→결과 재흡수. inplace=true면 {acc} 파일 직접 수정 후 재흡수.
 - 스텝마다 pre/post 바이트 diff → 실변경 스팬 산출(G2).
 - 게이트: G1 source_guard(regions: written>0; skipped/blanked는 warn) / G2 span_bounds(declared_spans 있는 스텝+regions 자동 스팬) / G3 determinism(전체 체인 2회 md5 동일, 기본 on) / G4 region_isolation(frame 있는 regions 스텝: before/after compose diff, 허용마스크=rect셀∪실기록셀 타일경계, 밖 픽셀 0) / G5 intended_change(엔트리 마스크 안 diff ≥ 10px).
+- comp_off 스텝의 게이트(2026-07-08): G2는 ROM 도메인(변경이 압축블록 슬롯 안)과 해제버퍼 도메인(변경이 rect 참조 타일 스팬 안) **이중** 검사, G4/G5는 해제버퍼 pre/post를 ROM 소스로 compose해 동일 시맨틱으로 수행. 재압축 예산 초과는 _StepError(체인 fail, out 미기록).
 - verdict fail → out 미기록, `<project>/.krpatch/gfx/runs/<ts>/rejected.gba` 격리. pass → out 기록(기존 파일은 `.bak-<ts>` 백업 선행).
 - run report: `<project>/.krpatch/gfx/runs/<ts>.json` — {run_id, chain, version, inputs(md5), steps[], gates{}, verdict, attention[], artifacts{}, output_md5}.
 - 리턴은 요약 투영: {run_id, verdict, first_fail, out, md5, counters, attention, report_path}.

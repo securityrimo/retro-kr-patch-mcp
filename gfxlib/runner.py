@@ -75,6 +75,12 @@ def _get_render():
     return render
 
 
+def _get_compress():
+    """압축 코덱 모듈(LZ77/RLE — regions comp_off 스텝용)."""
+    from . import compress
+    return compress
+
+
 # ── 순수 유틸 ────────────────────────────────────────────────────────
 
 def _md5(b: bytes) -> str:
@@ -309,6 +315,23 @@ def _exec_chain(root, cfg, ch, version, step_filter, wd, *,
             bg = step["_bg"]
             base = step["_rom_base"]
             redraw = _get_redraw()
+            # 압축블록 스텝: 1회 해제 → N개 rect → 1회 재압축(예산 안정)
+            comp_off = step.get("_comp_off")
+            pre_buf = None
+            comp_slot = None
+            comp_kind = None
+            if comp_off is not None:
+                Cmod = _get_compress()
+                try:
+                    pre_buf, _csz, comp_kind = Cmod.decompress(
+                        bytes(acc), comp_off)
+                except Cmod.CompressError as ex:
+                    raise _StepError(
+                        f"[{name}] 압축블록 해제 실패 @{comp_off:#x}: {ex}")
+                comp_slot = ((_csz + 3) // 4) * 4
+                work = bytearray(pre_buf)
+            else:
+                work = acc
             items_rep = []
             for k, it in enumerate(step["items"]):
                 kwargs = {"font_path": font}
@@ -321,7 +344,7 @@ def _exec_chain(root, cfg, ch, version, step_filter, wd, *,
                     os.makedirs(previews_dir, exist_ok=True)
                     kwargs["preview_path"] = os.path.join(
                         previews_dir, f"{name}_{k:02d}.png")
-                r = redraw.redraw_rect(acc, frame, bg, base, it["_rect"],
+                r = redraw.redraw_rect(work, frame, bg, base, it["_rect"],
                                        it["text"], **kwargs)
                 label = f"{name}[{k}]:{it['text']}"
                 written = int(r.get("tiles") or 0)
@@ -343,6 +366,16 @@ def _exec_chain(root, cfg, ch, version, step_filter, wd, *,
                     elif status == "warn":
                         collect["warnings"] += 1
                         collect["attention"].append(f"G1 warn(무기록/blank): {label}")
+            if comp_off is not None:
+                pr = Cmod.patch_compressed(acc, comp_off, bytes(work),
+                                           kind=comp_kind)
+                srep["compress"] = {"comp_off": comp_off,
+                                    "kind": comp_kind, **pr}
+                if not pr.get("ok"):
+                    raise _StepError(
+                        f"[{name}] 재압축 예산 초과: {pr.get('need')}B > "
+                        f"슬롯 {pr.get('budget')}B — 텍스트 축약 또는 "
+                        f"블록 재배치 필요")
             srep["items"] = items_rep
             srep["frame_dir"] = frame_dir
 
@@ -367,16 +400,39 @@ def _exec_chain(root, cfg, ch, version, step_filter, wd, *,
                          "declared": _hex_spans(allowed)})
             elif stype == "regions":
                 geom = _regions_geometry(plat, frame, bg, base, step["items"])
-                bad = _uncovered(spans, geom["allowed_spans"])
-                collect["g2"]["checked"].append(name)
-                if bad:
-                    collect["g2"]["pass"] = False
-                    collect["g2"]["violations"].append(
-                        {"step": name, "spans": _hex_spans(bad),
-                         "declared": _hex_spans(geom["allowed_spans"])})
-                # ── G4/G5: compose 기반 픽셀 검증 ──
-                _gate_pixels(collect, name, step, geom, frame, bg, base,
-                             pre, post, spans)
+                if comp_off is not None:
+                    # 압축 스텝: ROM 변경은 압축블록 슬롯 안이어야(G2),
+                    # 픽셀 게이트(G4/G5)는 해제버퍼 도메인에서 수행
+                    allowed = [(comp_off, comp_off + comp_slot)]
+                    bad = _uncovered(spans, allowed)
+                    collect["g2"]["checked"].append(name)
+                    if bad:
+                        collect["g2"]["pass"] = False
+                        collect["g2"]["violations"].append(
+                            {"step": name, "spans": _hex_spans(bad),
+                             "declared": _hex_spans(allowed)})
+                    post_buf = bytes(work)
+                    buf_spans = _diff_spans(pre_buf, post_buf)
+                    bad_buf = _uncovered(buf_spans, geom["allowed_spans"])
+                    if bad_buf:
+                        collect["g2"]["pass"] = False
+                        collect["g2"]["violations"].append(
+                            {"step": name + "(decompressed)",
+                             "spans": _hex_spans(bad_buf),
+                             "declared": _hex_spans(geom["allowed_spans"])})
+                    _gate_pixels(collect, name, step, geom, frame, bg, base,
+                                 pre_buf, post_buf, buf_spans)
+                else:
+                    bad = _uncovered(spans, geom["allowed_spans"])
+                    collect["g2"]["checked"].append(name)
+                    if bad:
+                        collect["g2"]["pass"] = False
+                        collect["g2"]["violations"].append(
+                            {"step": name, "spans": _hex_spans(bad),
+                             "declared": _hex_spans(geom["allowed_spans"])})
+                    # ── G4/G5: compose 기반 픽셀 검증 ──
+                    _gate_pixels(collect, name, step, geom, frame, bg, base,
+                                 pre, post, spans)
             elif stype == "cmd":
                 collect["g2"]["skipped"].append(
                     {"step": name, "reason": "declared_spans 미선언"})

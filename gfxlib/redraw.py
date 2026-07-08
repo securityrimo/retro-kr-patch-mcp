@@ -91,6 +91,9 @@ def redraw_rect(rom, frame, bg, base, rect, text, *,
     vram = frame["vram"]; io = frame["io"]; pal = frame["palette"]
     cnt = struct.unpack("<H", io[8+bg*2:8+bg*2+2])[0]
     scrbase = ((cnt >> 8) & 0x1F)*0x800
+    bpp8 = bool(cnt & 0x80)
+    tsz = 64 if bpp8 else 32
+    ncol = 256 if bpp8 else 16
     cells = []; palnos = Counter()
     for ty in range(ry0, ry1+1):
         for tx in range(rx0, rx1+1):
@@ -124,18 +127,26 @@ def redraw_rect(rom, frame, bg, base, rect, text, *,
     bx0, by0 = ctx0*8, cty0*8; bw, bh = (ctx1-ctx0+1)*8, (cty1-cty0+1)*8
     MARGIN = float(margin)
     def rgb(i):
-        b = palno*32; c = struct.unpack("<H", pal[b+i*2:b+i*2+2])[0]
+        b = 0 if bpp8 else palno*32
+        c = struct.unpack("<H", pal[b+i*2:b+i*2+2])[0]
         return ((c & 31) << 3, ((c >> 5) & 31) << 3, ((c >> 10) & 31) << 3)
-    PAL = [rgb(i) for i in range(16)]
+    PAL = [rgb(i) for i in range(ncol)]
     def sat(c): return max(c)-min(c)
     def lum(c): return 0.3*c[0]+0.59*c[1]+0.11*c[2]
     # 이 라벨 타일이 실제 쓰는 인덱스만으로 역할 판정(팔레트 전체 아님 — 뱅크 공유 오검출 방지)
     _hist = Counter()
     for tx, ty, t, pn, hf, vf in cells:
-        for bb in rom[base+t*32:base+t*32+32]:
-            _hist[bb & 0xF] += 1; _hist[bb >> 4] += 1
+        off = base+t*tsz
+        if off < 0 or off+tsz > len(rom):
+            raise ValueError(f"타일 {t} ROM 범위 밖: off={off}")
+        if bpp8:
+            for bb in rom[off:off+tsz]:
+                _hist[bb] += 1
+        else:
+            for bb in rom[off:off+tsz]:
+                _hist[bb & 0xF] += 1; _hist[bb >> 4] += 1
     _tot = sum(v for i, v in _hist.items() if i)
-    used_idx = [i for i in range(1, 16) if _hist[i] > _tot*0.02] or [i for i in range(1, 16) if _hist[i]]
+    used_idx = [i for i in range(1, ncol) if _hist[i] > _tot*0.02] or [i for i in range(1, ncol) if _hist[i]]
     colors = [(i, PAL[i]) for i in used_idx]
     chroma = [(i, c) for i, c in colors if sat(c) > 40] or colors
     fill_bright = max(chroma, key=lambda z: sat(z[1])*(lum(z[1])+40))[0]
@@ -191,18 +202,57 @@ def redraw_rect(rom, frame, bg, base, rect, text, *,
         cell = [[canvas[ty*8+yy][tx*8+xx] for xx in range(8)] for yy in range(8)]
         if hf: cell = [row[::-1] for row in cell]
         if vf: cell = cell[::-1]
-        enc = bytearray(32)
-        for yy in range(8):
-            for xx in range(0, 8, 2):
-                enc[yy*4+xx//2] = (cell[yy][xx] & 0xF) | ((cell[yy][xx+1] & 0xF) << 4)
-        off = base+t*32
+        if bpp8:
+            enc = bytearray(64)
+            for yy in range(8):
+                for xx in range(8):
+                    enc[yy*8+xx] = cell[yy][xx] & 0xFF
+        else:
+            enc = bytearray(32)
+            for yy in range(8):
+                for xx in range(0, 8, 2):
+                    enc[yy*4+xx//2] = (cell[yy][xx] & 0xF) | ((cell[yy][xx+1] & 0xF) << 4)
+        off = base+t*tsz
         if t in written and written[t] != bytes(enc): conflict += 1
         written[t] = bytes(enc)
-        if not dry_run: rom[off:off+32] = enc
+        if not dry_run: rom[off:off+tsz] = enc
     return {"ok": True, "cells": len(cells), "tiles": len(written), "conflicts": conflict,
-            "palno": palno,
+            "palno": palno, "bpp8": bpp8,
             "chosen": {"hi": IDX_HI, "fill": fill_bright, "dark": fill_dark, "ol": IDX_OL},
             "px": px_used, "preview": preview_path}
+
+
+def redraw_rect_compressed(rom, frame, bg, comp_off, base, rect, text, *,
+                           font_path, hi=None, fill=None, dark=None, ol=None,
+                           excl=None, margin=0.86, preview_path=None,
+                           dry_run=False, vram_safe=True):
+    """압축(LZ77/RLE) 타일 그래픽 rect 재작화 — 해제→rect엔진→재압축 in-place.
+
+    comp_off = ROM 내 압축블록 오프셋, base = 해제 버퍼 내 타일0 기준 오프셋
+    (locate_compressed 반환값). rect 엔진은 redraw_rect를 해제 버퍼에 그대로
+    적용하므로 팔레트 역할판정·마스크 렌더 시맨틱 동일.
+    예산 = 기존 압축블록 슬롯(4정렬). 초과 시 rom 미수정 + budget 정보 반환.
+    반환: redraw_rect 결과 + {"comp_off","kind","compress":{...}}
+    """
+    from . import compress as C
+    buf_bytes, comp_size, kind = C.decompress(bytes(rom), comp_off)
+    buf = bytearray(buf_bytes)
+    res = redraw_rect(buf, frame, bg, base, rect, text,
+                      font_path=font_path, hi=hi, fill=fill, dark=dark,
+                      ol=ol, excl=excl, margin=margin,
+                      preview_path=preview_path, dry_run=dry_run)
+    res["comp_off"] = comp_off
+    res["kind"] = kind
+    if not res.get("ok") or dry_run:
+        res["compress"] = {"skipped": True}
+        return res
+    pr = C.patch_compressed(rom, comp_off, bytes(buf), kind=kind,
+                            vram_safe=vram_safe)
+    res["compress"] = pr
+    if not pr.get("ok"):
+        res["ok"] = False
+        res["error"] = pr.get("err", "재압축 예산 초과")
+    return res
 
 
 def load_plugin(path):

@@ -26,7 +26,24 @@ from mcp.server.fastmcp import FastMCP
 OUTPUT_DIR = Path("/root/projects/retro-kr-patch-mcp/output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-mcp = FastMCP("retro-kr-patch-tools")
+_INSTRUCTIONS = """레트로 한글화 도구 서버 — 스캔/번역/인젝션/검증/그래픽 파이프라인.
+
+[모델 분배 — 이 도구군으로 subagent/workflow를 구성할 때의 표준]
+작업을 위임할 때는 파일 서브에이전트 krpatch-*(카테고리 krpatch, /subagent 스킬로 관리)를 쓰고,
+없는 환경이면 아래 티어를 model 파라미터로 직접 지정한다:
+  • 기계적 스캔·집계(scan_strings/scan_pointers/coverage_gap_scan/rom_diff) → krpatch-scan (haiku)
+  • 번역·윤문·바이트예산 축약(translate_pipeline/inject_budgeted_text) → krpatch-translate (sonnet)
+  • 게이트 사후검증·회귀 판정(verify_*/glyph_slot_audit) → krpatch-verify (sonnet)
+  • 그래픽 캡처·재작화(gfx_*) → krpatch-gfx (sonnet)
+  • 렌더러 규약·폰트 base 등 리버싱 근본원인(emucap 병용) → krpatch-re-debug (opus, 투입 전 사용자 노티)
+메인(상위) 모델은 오케스트레이션·판정 종합만 맡고, 대량 반복 작업을 직접 수행하지 않는다.
+translate_pipeline 내부 API 모델은 models="stage=model,..." 또는 KRPATCH_MODEL_* env로 분배한다
+(기본 deepseek-chat; glossary/labels=상위, draft/refine=경량 권장).
+
+[불변식] 모든 인젝션은 T1~T5, 그래픽은 G1~G5 게이트를 자동 통과해야 하며 실패 산출물은 .rejected 격리된다.
+게이트 우회 금지. 바이트 예산은 널 종단 포함(budget−1)."""
+
+mcp = FastMCP("retro-kr-patch-tools", instructions=_INSTRUCTIONS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -364,6 +381,9 @@ def scan_strings(rom_path: str, encoding: str = "sjis", min_length: int = 4,
     min_length: 최소 문자열 길이 (이보다 짧으면 무시)
     offset_start/offset_end: 스캔 범위 (16진수, 생략 시 전체)
 
+    길이 의미론: length = 종단 null 제외(하위호환), byte_len_with_null =
+    null 포함(run 직후가 0x00일 때). 주입 예산에는 with_null을 쓸 것.
+
     용례: "화면에 보이는 일본어 대사를 ROM에서 찾기"
     """
     data = _read_rom(rom_path)
@@ -439,6 +459,9 @@ def scan_strings(rom_path: str, encoding: str = "sjis", min_length: int = 4,
                 "offset": f"${abs_offset:X}",
                 "offset_dec": abs_offset,
                 "length": len(current_run),
+                # 종단 null 포함 길이 — run 직후 바이트가 0x00일 때만 +1.
+                # 주입 예산 계산에는 이 값을 쓸 것 (length는 null 제외 하위호환).
+                "byte_len_with_null": len(current_run) + (1 if b == 0 else 0),
                 "hex": current_run[:40].hex(" "),
                 "text": decoded[:100],
             })
@@ -452,6 +475,7 @@ def scan_strings(rom_path: str, encoding: str = "sjis", min_length: int = 4,
         "encoding": encoding,
         "range": f"${start:X}-${end:X}",
         "min_length": min_length,
+        "byte_len_semantics": "length=without_null; byte_len_with_null=with_null",
         "count": len(results),
         "results": results,
     }, ensure_ascii=False, indent=2)
@@ -1621,7 +1645,7 @@ def review_dashboard(project_dir: str, action: str = "start",
 def translate_pipeline(project_dir: str, action: str = "run",
                        game: str = "", scope: str = "all",
                        start: str = "", lines: int = 24,
-                       apply: bool = False) -> str:
+                       apply: bool = False, models: str = "") -> str:
     """장면-인지 2단계 번역 파이프라인 (ROM/프로젝트 무관, codec-driven).
 
     문자열 1개씩 독립 번역의 한계(화자·맥락·줄간 일관성 부재)를 개선:
@@ -1636,6 +1660,11 @@ def translate_pipeline(project_dir: str, action: str = "run",
       status   : 전수 run 진행/완료 상태 + 로그 tail.
 
     글로서리→라벨→(사용자 확인)→run 순서 권장. DEEPSEEK_API_KEY 필요.
+
+    models: 스테이지별 모델 분배 "stage=model,..." (stage∈ glossary|labels|draft|refine|default).
+      예 "glossary=deepseek-reasoner,refine=deepseek-chat". 미지정 스테이지는
+      KRPATCH_MODEL_<STAGE> env → KRPATCH_MODEL_DEFAULT → deepseek-chat 순.
+      권장 분배: glossary/labels(세계지식·축약판단)=상위, draft/refine(대량)=경량.
     """
     import subprocess
     import sys
@@ -1667,6 +1696,22 @@ def translate_pipeline(project_dir: str, action: str = "run",
         return json.dumps({"ok": True, "running": bool(p), "pid": p, "log_tail": tail},
                           ensure_ascii=False)
 
+    # models="stage=model,..." → 워커 env KRPATCH_MODEL_<STAGE> 로 전달
+    env = dict(os.environ)
+    _STAGES = {"glossary", "labels", "draft", "refine", "default"}
+    for pair in filter(None, (p.strip() for p in models.split(","))):
+        if "=" not in pair:
+            return json.dumps({"ok": False, "err": f"models 형식 오류: {pair!r} (stage=model)"},
+                              ensure_ascii=False)
+        st, mdl = (x.strip() for x in pair.split("=", 1))
+        if st not in _STAGES:
+            return json.dumps({"ok": False, "err": f"미지원 stage {st!r} (허용: {sorted(_STAGES)})"},
+                              ensure_ascii=False)
+        if not re.fullmatch(r"[A-Za-z0-9._:\-]{1,64}", mdl):
+            return json.dumps({"ok": False, "err": f"model 이름 형식 오류: {mdl!r}"},
+                              ensure_ascii=False)
+        env[f"KRPATCH_MODEL_{st.upper()}"] = mdl
+
     argv = [sys.executable, tp, str(root), action]
     if action == "glossary":
         if game:
@@ -1681,7 +1726,7 @@ def translate_pipeline(project_dir: str, action: str = "run",
 
     # 전수 run(백그라운드가 아닌 start 지정 없는 apply 전수)은 장시간 → detached
     if action == "run" and not start and scope == "all":
-        proc = subprocess.Popen(argv, cwd=str(root), env=dict(os.environ),
+        proc = subprocess.Popen(argv, cwd=str(root), env=env,
                                 stdout=open(logfile, "w"), stderr=subprocess.STDOUT,
                                 start_new_session=True)
         pidfile.write_text(str(proc.pid))
@@ -1691,7 +1736,7 @@ def translate_pipeline(project_dir: str, action: str = "run",
 
     # glossary / labels / 스코프 run 은 동기(최대 10분)
     try:
-        out = subprocess.run(argv, cwd=str(root), env=dict(os.environ),
+        out = subprocess.run(argv, cwd=str(root), env=env,
                              capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         return json.dumps({"ok": False, "err": "timeout(600s) — 전수는 scope=all 로 백그라운드 실행"},
@@ -1733,9 +1778,11 @@ def _gfx_import():
     import sys
     if _GFX_ROOT not in sys.path:
         sys.path.insert(0, _GFX_ROOT)
-    from gfxlib import manifest, capture, worker, gba, render, redraw, runner
+    from gfxlib import (manifest, capture, worker, gba, render, redraw,
+                        runner, compress)
     return {"manifest": manifest, "capture": capture, "worker": worker,
-            "gba": gba, "render": render, "redraw": redraw, "runner": runner}
+            "gba": gba, "render": render, "redraw": redraw, "runner": runner,
+            "compress": compress}
 
 
 def _gfx_hex(v: str, glib) -> int:
@@ -2157,12 +2204,15 @@ def gfx_analyze(frame_dir: str, action: str = "report", bg: int = -1,
 
     action:
       report : DISPCNT/BG 요약 + compose PNG + (base_rom 지정 시) 활성 BG별
-               locate·판정 — native(무압축 역탐색 확정, mode0·4bpp) /
-               plugin(base 확정이나 8bpp·affine) / blocked(rom.find 실패)
+               locate·판정 — native(무압축 역탐색 확정, 4bpp/8bpp) /
+               compressed(LZ77·RLE 블록 내 역탐색 확정 — comp_off 재작화 가능) /
+               plugin(affine BG) / blocked(무압축·압축 역탐색 모두 실패)
       grid   : BG bg 를 8px 그리드+셀좌표 오버레이 PNG 로 (rom_base 로 ROM 타일)
       render : bg>=0 이면 render_bg, bg<0 이면 compose(우선순위 합성) PNG
       objs   : OAM OBJ 목록 + OBJ 시트 PNG
-      locate : BG bg 사용 타일로 base_rom 내 무압축 원본 base 역탐색
+      locate : BG bg 사용 타일로 base_rom 내 원본 base 역탐색 — 무압축 실패 시
+               압축블록 스캔 자동 폴백(compressed 필드에 comp_off/kind)
+      scan   : base_rom 전체 압축블록(LZ77/RLE) 후보 목록(최대 200개)
       verify : VRAM 렌더 vs ROM(base_rom+rom_base) 재렌더 픽셀 diff
                (rect="x0,y0,x1,y1" 셀사각 지정 시 안/밖 분리 집계)
 
@@ -2212,6 +2262,8 @@ def gfx_analyze(frame_dir: str, action: str = "report", bg: int = -1,
     d = gba.dispcnt(fr["io"])
 
     if action == "report":
+        compress = glib["compress"]
+        comp_blocks = None   # 압축블록 스캔은 BG 간 공유(1회)
         out = {"ok": True, "frame_dir": str(fdir), "dispcnt": d, "bgs": []}
         for n in range(4):
             if not d["bg"][n]:
@@ -2225,17 +2277,34 @@ def gfx_analyze(frame_dir: str, action: str = "report", bg: int = -1,
                 entry["locate"] = loc
                 reasons = []
                 if loc["base"] is None:
-                    entry["verdict"] = "blocked"
-                    reasons.append("rom.find 실패(압축/동적 생성 추정)")
-                elif c["bpp8"] or affine:
+                    # 무압축 실패 → 압축블록 역탐색 폴백
+                    if comp_blocks is None:
+                        comp_blocks = compress.scan_blocks(rom)
+                    lc = compress.locate_compressed(fr, n, rom,
+                                                    blocks=comp_blocks)
+                    if lc.get("base") is not None:
+                        entry["locate_compressed"] = {
+                            **lc, "comp_off_hex": hex(lc["comp_off"]),
+                            "base_hex": hex(lc["base"])}
+                        if affine:
+                            entry["verdict"] = "plugin"
+                            reasons.append("압축 base 확정이나 affine BG")
+                        else:
+                            entry["verdict"] = "compressed"
+                            reasons.append(
+                                f"{lc['kind']} 블록 @{hex(lc['comp_off'])} "
+                                "역탐색 확정 — comp_off 재작화 가능")
+                    else:
+                        entry["verdict"] = "blocked"
+                        reasons.append("무압축·압축 역탐색 모두 실패"
+                                       "(미지원 압축/동적 생성 추정)")
+                elif affine:
                     entry["verdict"] = "plugin"
-                    if c["bpp8"]:
-                        reasons.append("8bpp — rect 엔진(4bpp) 범위 밖")
-                    if affine:
-                        reasons.append("affine BG")
+                    reasons.append("affine BG")
                 else:
                     entry["verdict"] = "native"
-                    reasons.append("무압축 역탐색 확정 — redraw_rect 가능")
+                    reasons.append("무압축 역탐색 확정 — redraw_rect 가능"
+                                   + (" (8bpp)" if c["bpp8"] else ""))
                 entry["reasons"] = reasons
             else:
                 entry["verdict"] = "unknown"
@@ -2273,7 +2342,26 @@ def gfx_analyze(frame_dir: str, action: str = "report", bg: int = -1,
                "matches": loc["ok"], "checked": loc["checked"]}
         if loc["base"] is not None:
             out["base_hex"] = hex(loc["base"])
+        else:
+            lc = glib["compress"].locate_compressed(fr, bg, rom)
+            if lc.get("base") is not None:
+                out["compressed"] = {**lc,
+                                     "comp_off_hex": hex(lc["comp_off"]),
+                                     "base_hex": hex(lc["base"])}
+            else:
+                out["compressed"] = {"base": None,
+                                     "blocks_scanned":
+                                         lc.get("blocks_scanned")}
         return _gfx_json(out)
+
+    if action == "scan":
+        if rom is None:
+            return _gfx_err("scan 은 base_rom 필요")
+        blocks = glib["compress"].scan_blocks(rom, limit=200)
+        return _gfx_json({"ok": True, "count": len(blocks),
+                          "truncated": len(blocks) >= 200,
+                          "blocks": [{**b, "off_hex": hex(b["off"])}
+                                     for b in blocks]})
 
     if action == "verify":
         if bg < 0 or rom is None or rb is None:
@@ -2302,7 +2390,7 @@ def gfx_analyze(frame_dir: str, action: str = "report", bg: int = -1,
         return _gfx_json(out)
 
     return _gfx_err(f"action 불량: {action} "
-                    "(report|grid|render|objs|locate|verify)")
+                    "(report|grid|render|objs|locate|scan|verify)")
 
 
 @mcp.tool()
@@ -2310,23 +2398,30 @@ def gfx_build(project_dir: str, action: str = "manifest", chain: str = "",
               screen: str = "", steps: str = "", version: str = "",
               bg: int = -1, rom_base: str = "", rect: str = "", text: str = "",
               overrides: str = "", excl: str = "", base_rom: str = "",
-              out_rom: str = "", preview: bool = False, deploy: bool = False) -> str:
+              out_rom: str = "", comp_off: str = "",
+              preview: bool = False, deploy: bool = False) -> str:
     """그래픽 빌드 — 매니페스트 체인 실행(게이트 G1~G5) 또는 단일 rect 재작화.
 
     action:
       manifest : krpatch.gfx.json 의 chain(기본 "release")을 runner.run_chain 으로
                  실행. steps="a,b" 부분 실행, preview=True 면 out 미기록.
                  deploy=True 면 verdict pass 시 cfg deploy 디렉터리로 cp+md5 확인.
-      region   : 단일 rect 직접 재작화(runner 미경유, redraw_rect). screen(frame),
-                 bg, rect="x0,y0,x1,y1", text 필수. rom_base 비우면 locate 자동.
-                 base_rom 비우면 매니페스트 rom. preview=True 면 ROM 미기록,
-                 프리뷰 PNG 만(.krpatch/gfx/previews/). 아니면 out_rom 에 기록.
+                 (regions 스텝에 comp_off 지정 시 압축블록 재작화 — 1회 해제→
+                 N개 rect→1회 재압축, 예산=기존 슬롯)
+      region   : 단일 rect 직접 재작화(runner 미경유). screen(frame), bg,
+                 rect="x0,y0,x1,y1", text 필수. rom_base 비우면 locate 자동
+                 (무압축 실패 시 압축블록 역탐색 폴백). comp_off="0x.." 지정
+                 또는 압축 역탐색 확정 시 redraw_rect_compressed(해제→재작화→
+                 재압축 in-place, 예산 초과 시 미기록). base_rom 비우면
+                 매니페스트 rom. preview=True 면 ROM 미기록, 프리뷰 PNG 만
+                 (.krpatch/gfx/previews/). 아니면 out_rom 에 기록.
       status   : 최근 run 요약 목록(.krpatch/gfx/runs)
       report   : 최신 run report 전체
       deploy   : out_rom(비우면 최신 pass run 의 out)을 deploy 디렉터리로 cp
 
     overrides: "hi=6,fill=5,dark=3,ol=1" 팔레트 역할 수동 지정(비우면 자동판정).
-    excl: 제외 셀사각 "x0,y0,x1,y1". rom_base: "0x.." 16진.
+    excl: 제외 셀사각 "x0,y0,x1,y1". rom_base/comp_off: "0x.." 16진.
+    comp_off 지정 시 rom_base 는 해제버퍼 내 타일0 기준 오프셋.
     게임 특화값은 전부 매니페스트/인자 — 이 도구에 하드코딩 없음.
     """
     import shutil
@@ -2451,31 +2546,66 @@ def gfx_build(project_dir: str, action: str = "manifest", chain: str = "",
                 except ValueError as e:
                     return _gfx_err(f"overrides 값 파싱 실패: {e}")
         rom_ba = bytearray(Path(src).read_bytes())
+        compress = glib["compress"]
         rb = None
+        co = None
+        if comp_off:
+            try:
+                co = manifest.parse_int(comp_off)
+            except ValueError as e:
+                return _gfx_err(f"comp_off 파싱 실패: {e}")
         if rom_base:
             try:
                 rb = manifest.parse_int(rom_base)
             except ValueError as e:
                 return _gfx_err(f"rom_base 파싱 실패: {e}")
+        elif co is not None:
+            # comp_off 만 지정: 그 블록 안에서 base 역탐색
+            try:
+                _, csz, kind = compress.decompress(bytes(rom_ba), co)
+            except compress.CompressError as e:
+                return _gfx_err(f"comp_off 블록 해제 실패: {e}")
+            lc = compress.locate_compressed(
+                fr, bg, bytes(rom_ba),
+                blocks=[{"off": co, "kind": kind, "comp_size": csz,
+                         "decomp_size": 0}])
+            if lc.get("base") is None:
+                return _gfx_json({"ok": False,
+                                  "err": "블록 내 역탐색 실패 — rom_base 직접 지정 필요",
+                                  "locate_compressed": lc})
+            rb = lc["base"]
         else:
             loc = redraw.locate(fr, bg, bytes(rom_ba))
-            if loc["base"] is None:
-                return _gfx_json({"ok": False, "err": "locate 실패 — rom_base 직접 지정 필요",
-                                  "locate": loc})
-            rb = loc["base"]
+            if loc["base"] is not None:
+                rb = loc["base"]
+            else:
+                lc = compress.locate_compressed(fr, bg, bytes(rom_ba))
+                if lc.get("base") is None:
+                    return _gfx_json({"ok": False,
+                                      "err": "무압축·압축 역탐색 모두 실패 — "
+                                             "rom_base(+comp_off) 직접 지정 필요",
+                                      "locate": loc, "locate_compressed": lc})
+                rb = lc["base"]
+                co = lc["comp_off"]
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         prev_dir = root / ".krpatch" / "gfx" / "previews"
         prev_dir.mkdir(parents=True, exist_ok=True)
         prev_path = str(prev_dir / f"{screen}_bg{bg}_{ts}.png")
+        common = dict(font_path=font, hi=ov.get("hi"), fill=ov.get("fill"),
+                      dark=ov.get("dark"), ol=ov.get("ol"), excl=ex,
+                      preview_path=prev_path, dry_run=preview)
         try:
-            res = redraw.redraw_rect(
-                rom_ba, fr, bg, rb, rc, text, font_path=font,
-                hi=ov.get("hi"), fill=ov.get("fill"), dark=ov.get("dark"),
-                ol=ov.get("ol"), excl=ex, preview_path=prev_path,
-                dry_run=preview)
+            if co is not None:
+                res = redraw.redraw_rect_compressed(
+                    rom_ba, fr, bg, co, rb, rc, text, **common)
+            else:
+                res = redraw.redraw_rect(rom_ba, fr, bg, rb, rc, text,
+                                         **common)
         except Exception as e:
-            return _gfx_err(f"redraw_rect 실패: {type(e).__name__}: {e}")
+            return _gfx_err(f"redraw 실패: {type(e).__name__}: {e}")
         out = {"ok": bool(res.get("ok")), "rom_base": hex(rb), **res}
+        if co is not None:
+            out["comp_off"] = hex(co)
         if preview or not res.get("ok"):
             out["written"] = False
             return _gfx_json(out)
@@ -2613,6 +2743,261 @@ def font_base_probe(rom_path: str, table_offset: str, table_entries: int,
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 텍스트 경로 정합성 게이트 (T1~T5) — gfx 파이프라인 G1~G5의 텍스트 대응물
+# (2026-07-07 예산 꽉 채운 주입이 종단자를 덮어 "정답입니다.오답입니다."로
+#  인접 문자열이 병합된 사고의 재발 방지 계층)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _tp_is_lead(b: int) -> bool:
+    """SJIS 2바이트 선두 바이트 판정 (0x81-0x9F, 0xE0-0xEF)."""
+    return 0x81 <= b <= 0x9F or 0xE0 <= b <= 0xEF
+
+
+def _tp_load_tokens(ctrl_tokens: str = "", tokens_path: str = "",
+                    rom_path: str = "") -> list:
+    """제어 토큰 레지스트리 로드.
+
+    소스 3계층 병합: ctrl_tokens 인자(인라인 JSON 또는 파일 경로) +
+    tokens_path 파일 + ROM 옆 krpatch.tokens.json 자동 탐지.
+    토큰 정의: {"name", "bytes"(hex 문자열) 또는 "text", "atomic"(기본 true)}
+    정규화 결과: {"name", "bytes": bytes, "text": str, "atomic": bool}
+    - bytes만 주면 text = latin-1 디코드(예: "41" → "A")
+    - text만 주면 bytes = cp932 인코드(예: "↓" → 게임 원 인코딩)
+    """
+    raw = []
+
+    def _load_one(src):
+        if not src:
+            return
+        try:
+            p = Path(src)
+            data = (json.loads(p.read_text(encoding="utf-8"))
+                    if len(src) < 4096 and p.exists() else json.loads(src))
+        except Exception:
+            return
+        if isinstance(data, list):
+            raw.extend(data)
+
+    _load_one(ctrl_tokens)
+    _load_one(tokens_path)
+    if rom_path:
+        side = Path(rom_path).parent / "krpatch.tokens.json"
+        if side.exists() and str(side) != str(tokens_path):
+            _load_one(str(side))
+
+    toks, seen = [], set()
+    for t in raw:
+        if not isinstance(t, dict):
+            continue
+        b = bytes.fromhex(t["bytes"]) if t.get("bytes") else None
+        txt = t.get("text")
+        if b is None and txt is None:
+            continue
+        if b is None:
+            try:
+                b = txt.encode("cp932")
+            except Exception:
+                continue
+        if txt is None:
+            txt = b.decode("latin-1")
+        name = t.get("name") or f"tok_{b.hex()}"
+        if (name, b) in seen:
+            continue
+        seen.add((name, b))
+        toks.append({"name": name, "bytes": b, "text": txt,
+                     "atomic": bool(t.get("atomic", True))})
+    # 긴 토큰 우선 매칭 (접두 겹침 방지)
+    toks.sort(key=lambda t: -len(t["text"]))
+    return toks
+
+
+def _tp_token_sjis_codes(tokens: list) -> set:
+    """토큰 바이트의 u16 SJIS 코드 집합 — 글리프 슬롯 탈취 금지 목록."""
+    out = set()
+    for t in tokens:
+        b = t["bytes"]
+        if len(b) == 2:
+            out.add((b[0] << 8) | b[1])
+        elif len(b) == 1:
+            out.add(b[0])
+    return out
+
+
+def _tp_units(text: str, tokens: list) -> list:
+    """텍스트를 토큰-인지 단위로 분해 — [(kind, unit)] kind∈{'tok','ch'}.
+
+    토큰은 원자 단위(분리·절단 금지, unit=토큰 dict), 나머지는 1문자(unit=str).
+    절단은 반드시 이 단위 경계에서만 — 2바이트 쌍·토큰이 반으로 잘리지 않는다.
+    """
+    units, i = [], 0
+    while i < len(text):
+        for t in tokens:
+            tt = t["text"]
+            if tt and text.startswith(tt, i):
+                units.append(("tok", t))
+                i += len(tt)
+                break
+        else:
+            units.append(("ch", text[i]))
+            i += 1
+    return units
+
+
+def _tp_encode(text: str, host_map: dict, tokens: list) -> bytes:
+    """토큰-인지 인코더 — inject의 enc()와 동일 로직의 정본.
+
+    토큰 바이트는 그대로 통과(글리프 재매핑·cp932 폭 변환 금지),
+    host_map 음절은 2바이트 빅엔디언, ASCII 1바이트, 나머지 cp932 폴백.
+    """
+    out = bytearray()
+    for kind, u in _tp_units(text, tokens):
+        if kind == "tok":
+            out += u["bytes"]
+        elif u in host_map:
+            sj = host_map[u]
+            out += bytes([(sj >> 8) & 0xFF, sj & 0xFF])
+        elif ord(u) < 0x80:
+            out.append(ord(u))
+        else:
+            try:
+                out += u.encode("cp932")
+            except Exception:
+                out.append(0x3F)
+    return bytes(out)
+
+
+def _tp_decode(data: bytes, rev_map: dict, tokens: list) -> dict:
+    """_tp_encode의 역함수 — 기록된 바이트를 의도 텍스트로 복원.
+
+    우선순위: 토큰 바이트(긴 것 우선) → 2바이트 host 코드(역 host_map) →
+    ASCII → 반각 가나 → cp932 2바이트 폴백.
+    반환: {"text", "clean"(전 바이트 정상 디코드), "dangling_lead"(말미 절름 선두)}
+    """
+    toks = sorted(tokens, key=lambda t: -len(t["bytes"]))
+    out, i, clean, dangling = [], 0, True, False
+    n = len(data)
+    while i < n:
+        matched = False
+        for t in toks:
+            tb = t["bytes"]
+            if tb and data[i:i + len(tb)] == tb:
+                out.append(t["text"])
+                i += len(tb)
+                matched = True
+                break
+        if matched:
+            continue
+        b = data[i]
+        if _tp_is_lead(b):
+            if i + 1 >= n:
+                dangling = True
+                clean = False
+                break
+            code = (b << 8) | data[i + 1]
+            if code in rev_map:
+                out.append(rev_map[code])
+            else:
+                try:
+                    out.append(data[i:i + 2].decode("cp932"))
+                except Exception:
+                    out.append("�")
+                    clean = False
+            i += 2
+        elif 0x20 <= b < 0x80 or b in (0x09, 0x0A, 0x0D):
+            out.append(chr(b))
+            i += 1
+        elif 0xA1 <= b <= 0xDF:
+            out.append(bytes([b]).decode("cp932"))
+            i += 1
+        else:
+            out.append("�")
+            clean = False
+            i += 1
+    return {"text": "".join(out), "clean": clean, "dangling_lead": dangling}
+
+
+def _tp_safe_capacity(orig: bytes, off: int, term: int = 0) -> int:
+    """원본 ROM 기준 off부터의 실제 안전 기록 용량(바이트).
+
+    off부터 다음 종단자까지(=원본 필드) + 그 뒤 연속 종단자 패딩 run 끝까지.
+    호출자가 잘못된 byte_len/budget을 넘겨도 이 값으로 클램프하면
+    다음 필드의 첫 바이트를 절대 침범하지 않는다.
+    """
+    i, n = off, len(orig)
+    while i < n and orig[i] != term:
+        i += 1
+    while i < n and orig[i] == term:
+        i += 1
+    return i - off
+
+
+def _tp_verify_injection(rom_after: bytes, checked: list, rev_map: dict,
+                         tokens: list, term: int = 0) -> dict:
+    """주입 후 정합성 게이트 T1~T5 실행 — gfx G1~G5 대응.
+
+    checked: [{off, window, intended, allow_prefix}] — window는 종단자까지
+    포함한 필드 예산 윈도우(바이트), intended는 실제 기록 의도 텍스트.
+    T1 terminator_guard : 윈도우 안에 종단자 ≥1 (내용 끝 이후)
+    T2 decode_back      : 기록 바이트 재디코드 == 의도 텍스트
+                          (allow_prefix면 정당 절단의 접두 일치 허용)
+    T3 boundary_integrity: 절단면에 절름 SJIS 선두 바이트 금지
+    T4 no_merge         : 필드 시작부터 첫 종단자가 윈도우 안
+                          — 다음 필드로의 병합("정답입니다.오답입니다.") 차단
+    T5 ctrl_token_guard : 제어 토큰 multiset(이름 기준) 보존
+    반환: {"verdict": pass|fail, "gates": {T1..T5: {name, pass, fails[]}}}
+    """
+    from collections import Counter
+    tb = bytes([term & 0xFF])
+    gates = {g: {"name": nm, "pass": True, "fails": []} for g, nm in [
+        ("T1", "terminator_guard"), ("T2", "decode_back"),
+        ("T3", "boundary_integrity"), ("T4", "no_merge"),
+        ("T5", "ctrl_token_guard")]}
+
+    def _fail(g, off, **detail):
+        gates[g]["pass"] = False
+        if len(gates[g]["fails"]) < 30:
+            gates[g]["fails"].append({"off": f"0x{off:X}", **detail})
+
+    for it in checked:
+        off, window = it["off"], it["window"]
+        base = it["intended"]
+        allow_prefix = bool(it.get("allow_prefix"))
+        win = bytes(rom_after[off:off + window])
+        nul = win.find(tb)
+        if nul < 0:
+            _fail("T1", off, reason="윈도우 내 종단자 없음",
+                  window_hex=win[:24].hex(" "))
+            _fail("T4", off, reason="종단자 부재 — 다음 필드와 병합",
+                  window_hex=win[:24].hex(" "))
+            continue
+        content = win[:nul]
+        dec = _tp_decode(content, rev_map, tokens)
+        dtxt = dec["text"]
+        # T3: 절단면 무결성 — 종단자 직전 바이트가 절름 선두면 실패
+        if dec["dangling_lead"]:
+            _fail("T3", off, reason="말미 절름 SJIS 선두 바이트",
+                  tail_hex=content[-4:].hex(" "))
+        # T2: 재디코드 대조 (공백 제거본·정당 절단 접두 허용)
+        base_ns = base.replace(" ", "")
+        ok = dtxt in (base, base_ns) or (
+            allow_prefix and bool(dtxt)
+            and (base.startswith(dtxt) or base_ns.startswith(dtxt)))
+        if not ok:
+            _fail("T2", off, intended=base[:60], decoded=dtxt[:60])
+        # T5: 토큰 multiset 보존 (정당 접두 절단이면 잔여 토큰 손실은 허용)
+        if not (ok and allow_prefix and dtxt not in (base, base_ns)):
+            exp = Counter(u["name"] for k, u in _tp_units(base, tokens)
+                          if k == "tok")
+            got = Counter(u["name"] for k, u in _tp_units(dtxt, tokens)
+                          if k == "tok")
+            if exp != got:
+                _fail("T5", off, expected=dict(exp), got=dict(got),
+                      decoded=dtxt[:60])
+    verdict = "pass" if all(g["pass"] for g in gates.values()) else "fail"
+    return {"verdict": verdict, "gates": gates}
+
+
 @mcp.tool()
 def coverage_gap_scan(original_rom: str, patched_rom: str,
                       region_start: str, region_end: str,
@@ -2625,21 +3010,55 @@ def coverage_gap_scan(original_rom: str, patched_rom: str,
 
     null-종단 세그먼트 단위로 걷고, 각 세그먼트에서 원본과 첫 diff 위치까지를
     '미번역 접두부(budget)'로 마킹한다. 결과 JSON은 inject_budgeted_text 입력과 호환.
+
+    byte_len 의미론(명시): byte_len = 종단 null 제외, byte_len_with_null = 포함.
+    갭 확장 계산은 반드시 '모든 문자열(번역+미번역)'을 대상으로 해야 한다 —
+    번역된 세그먼트를 빼고 계산하면 인접 필드 침범을 놓친다. 각 항목의
+    next_string_start(다음 세그먼트 시작)를 기준으로만 패딩 차용이 안전하다.
+
+    병합 탐지: 원본 대비 패치롬에서 세그먼트 인벤토리(경계)를 비교해,
+    원본 2개 이상 세그먼트가 하나로 융합된(=종단자 소실) 구간을 merged로 보고.
     """
     try:
         orig = _read_rom(original_rom)
         pat = _read_rom(patched_rom)
         rs, re_ = int(region_start, 0), int(region_end, 0)
+
+        def _segments(buf):
+            """[rs, re_) 범위의 null-종단 세그먼트 (start, end) 목록."""
+            segs, i = [], rs
+            while i < re_:
+                if buf[i] == 0:
+                    i += 1
+                    continue
+                st = i
+                while i < re_ and buf[i] != 0:
+                    i += 1
+                segs.append((st, i))
+            return segs
+
+        segs_p = _segments(pat)
+        segs_o = _segments(orig)
+
+        # 병합 탐지 — 원본 세그먼트 2개 이상을 덮는 패치 세그먼트 (투 포인터)
+        merged = []
+        oi = 0
+        for st, en in segs_p:
+            while oi < len(segs_o) and segs_o[oi][1] <= st:
+                oi += 1
+            k, cover = oi, []
+            while k < len(segs_o) and segs_o[k][0] < en:
+                cover.append(segs_o[k])
+                k += 1
+            if len(cover) >= 2:
+                merged.append({
+                    "patched_off": st, "patched_end": en,
+                    "orig_segments": [{"off": a, "end": b} for a, b in cover],
+                })
+
         items = []
-        i = rs
-        while i < re_:
-            if pat[i] == 0:
-                i += 1
-                continue
-            st = i
-            while i < re_ and pat[i] != 0:
-                i += 1
-            seg_p, seg_o = pat[st:i], orig[st:i]
+        for si, (st, en) in enumerate(segs_p):
+            seg_p, seg_o = pat[st:en], orig[st:en]
             diff = next((k for k in range(len(seg_p)) if seg_p[k] != seg_o[k]), None)
             untr = seg_o[:diff] if diff is not None else seg_o
             try:
@@ -2652,6 +3071,8 @@ def coverage_gap_scan(original_rom: str, patched_rom: str,
             if kana + kanji >= min_jp_chars and ctrl == 0:
                 items.append({
                     "file_off": st, "byte_len": len(seg_p),
+                    "byte_len_with_null": len(seg_p) + (1 if en < re_ else 0),
+                    "next_string_start": segs_p[si + 1][0] if si + 1 < len(segs_p) else None,
                     "budget": diff if diff is not None else len(seg_p),
                     "jp_untranslated": jp,
                     "jp_full_orig": seg_o.split(b"\x00")[0].decode("cp932", errors="replace"),
@@ -2661,8 +3082,12 @@ def coverage_gap_scan(original_rom: str, patched_rom: str,
         out.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
         return json.dumps({
             "gaps": len(items), "total_bytes": sum(x["budget"] for x in items),
+            "byte_len_semantics": "byte_len=without_null; byte_len_with_null=with_null",
+            "merged_count": len(merged), "merged": merged[:30],
             "saved": str(out),
-            "next_action": "0건이면 커버리지 완전. 있으면 jp_untranslated를 번역해 "
+            "next_action": ("⚠ merged가 있으면 종단자 소실 병합 사고 — verify_injection으로 "
+                            "원인 항목을 특정해 재주입하라. " if merged else "") +
+                           "0건이면 커버리지 완전. 있으면 jp_untranslated를 번역해 "
                            "items에 'ko' 필드를 채우고 inject_budgeted_text로 주입. "
                            "번역 시 이름코드(①②)·줄바꿈(↓)·숫자코드(③~⑥)는 그대로 보존.",
             "sample": items[:5],
@@ -2726,23 +3151,43 @@ def inject_budgeted_text(rom_path: str, items_json: str, host_map_json: str,
                          ttf_path: str, out_path: str = "",
                          width: int = 12, height: int = 12, bpp: int = 4,
                          bytes_per_glyph: int = 0, min_host_gi: int = 300,
-                         pad_byte: str = "0x20") -> str:
-    """예산 내 in-place 한글 주입 (신규 음절 글리프 자동 렌더 포함).
+                         pad_byte: str = "0x00", terminator: str = "0x00",
+                         reserve_terminator: bool = True,
+                         budget_includes_terminator: bool = True,
+                         ctrl_tokens: str = "", tokens_path: str = "") -> str:
+    """예산 내 in-place 한글 주입 + 정합성 게이트 T1~T5 (gfx G1~G5 대응).
 
     items_json: [{file_off, budget, ko}] 배열 파일. ko의 한글 음절은 host_map으로
     인코딩하고, host_map에 없는 신규 음절은 미사용 슬롯(gi>=min_host_gi,
-    기존 host 미사용 sjis)에 TTF 렌더로 글리프를 만들어 자동 등록한다.
-    glyph_base는 반드시 font_base_probe로 검증한 '실효 베이스'를 줄 것.
-    예산 초과 시 공백 제거 → 문자 경계 절단, 잔여는 pad_byte로 패딩.
-    host_map_json 파일은 신규 음절이 추가된 상태로 갱신 저장된다.
+    기존 host 미사용 sjis, 등록 토큰과 충돌하지 않는 슬롯)에 TTF 렌더로
+    글리프를 만들어 자동 등록한다. glyph_base는 font_base_probe 검증값 필수.
+
+    불변식(2026-07-07 인접 문자열 병합 사고 재발 방지):
+    - 종단자 보존: 내용 뒤에 항상 terminator(기본 0x00) 1바이트를 기록한다.
+      budget_includes_terminator=True(기본)면 내용 예산 = budget - 1.
+      budget이 null 제외 관례(coverage_gap_scan의 byte_len)라면 False로 줄 것.
+    - pad_byte 기본 0x00 — 0x20 패딩이 인접 종단자를 지우던 2차 사고 차단.
+      비-null pad를 줘도 내용 직후 종단자 1바이트는 반드시 보장된다.
+    - 절단은 문자/제어토큰 단위 경계에서만 — 2바이트 쌍·토큰 절대 분리 금지.
+    - 안전 재산정: 원본 ROM에서 off의 실제 필드 용량(다음 종단자 + 연속 종단
+      패딩 run)을 걸어 확인, 초과 예산은 클램프(호출자 byte_len 오류 방어).
+    - 종단자조차 못 넣는 항목은 기록하지 않고 per-item 오류로 반환.
+    - 주입 후 T1~T5 게이트 전부 통과해야 out에 기록. 실패 시 <out>.rejected로
+      격리하고 기존 out/host_map은 건드리지 않는다.
+
+    ctrl_tokens/tokens_path: 제어 토큰 레지스트리(JSON). ROM 옆
+    krpatch.tokens.json도 자동 탐지. 토큰은 enc에서 그대로 통과되고
+    절단 시 분리되지 않으며 T5가 multiset 보존을 검증한다.
+    host_map_json 파일은 게이트 통과 시에만 신규 음절 반영 갱신된다.
     """
-    import bisect, shutil
-    from PIL import Image, ImageFont, ImageDraw
+    import shutil
     try:
-        rom = bytearray(_read_rom(rom_path))
+        orig_rom = _read_rom(rom_path)
+        rom = bytearray(orig_rom)
         toff = int(table_offset, 0)
         gbase = int(glyph_base, 0)
         pad = int(pad_byte, 0)
+        term = int(terminator, 0)
         if bytes_per_glyph <= 0:
             bytes_per_glyph = (width * bpp + 7) // 8 * height
         entries = _fv_read_table(bytes(rom), toff, table_entries)
@@ -2751,96 +3196,352 @@ def inject_budgeted_text(rom_path: str, items_json: str, host_map_json: str,
         host_map = {k: int(v) for k, v in
                     json.loads(hm_path.read_text(encoding="utf-8")).items()}
         items = json.loads(Path(items_json).read_text(encoding="utf-8"))
+        tokens = _tp_load_tokens(ctrl_tokens, tokens_path, rom_path)
+        token_sjis = _tp_token_sjis_codes(tokens)
 
         # 신규 음절 → 미사용 슬롯 + TTF 글리프
         need = sorted({ch for it in items for ch in it.get("ko", "")
                        if '가' <= ch <= '힣' and ch not in host_map})
         used = set(host_map.values())
-        free = [(c, gi) for c, gi in entries if gi >= min_host_gi and c not in used]
+        # 등록 토큰의 SJIS 코드와 겹치는 슬롯은 절대 탈취 금지 (A3)
+        free = [(c, gi) for c, gi in entries
+                if gi >= min_host_gi and c not in used and c not in token_sjis]
         if len(need) > len(free):
             return json.dumps({"error": f"슬롯 부족: 신규 {len(need)} > 여유 {len(free)}"},
                               ensure_ascii=False)
-        if bpp != 4:
-            return json.dumps({"error": "글리프 자동 렌더는 4bpp만 지원"}, ensure_ascii=False)
-        font = ImageFont.truetype(ttf_path, max(width, height))
-
-        def render_glyph(ch):
-            tmp = Image.new("L", (16, 16), 0)
-            d = ImageDraw.Draw(tmp)
-            bb = font.getbbox(ch)
-            ox = (width - (bb[2]-bb[0])) // 2 - bb[0]
-            oy = (height - (bb[3]-bb[1])) // 2 - bb[1]
-            d.text((ox, oy), ch, font=font, fill=255)
-            img = tmp.crop((0, 0, width, height))
-            px = img.load()
-            out = bytearray(bytes_per_glyph)
-            bpr = (width + 1) // 2
-            for y in range(height):
-                for xb in range(bpr):
-                    lo = min(3, px[xb*2, y]*3//255)
-                    hi = min(3, px[xb*2+1, y]*3//255) if xb*2+1 < width else 0
-                    out[y*bpr+xb] = (lo & 0xF) | ((hi & 0xF) << 4)
-            return bytes(out)
 
         glyphs_new = 0
-        for i, ch in enumerate(need):
-            sj, gi = free[i]
-            host_map[ch] = sj
-            rom[gbase + gi*bytes_per_glyph: gbase + (gi+1)*bytes_per_glyph] = render_glyph(ch)
-            glyphs_new += 1
+        if need:
+            if bpp != 4:
+                return json.dumps({"error": "글리프 자동 렌더는 4bpp만 지원"}, ensure_ascii=False)
+            from PIL import Image, ImageFont, ImageDraw
+            font = ImageFont.truetype(ttf_path, max(width, height))
 
-        def enc(text):
-            out = bytearray()
-            for ch in text:
-                if ch in host_map:
-                    sj = host_map[ch]
-                    out += bytes([(sj >> 8) & 0xFF, sj & 0xFF])
-                elif ord(ch) < 0x80:
-                    out.append(ord(ch))
-                else:
-                    try:
-                        out += ch.encode("cp932")
-                    except Exception:
-                        out.append(0x3F)
-            return bytes(out)
+            def render_glyph(ch):
+                tmp = Image.new("L", (16, 16), 0)
+                d = ImageDraw.Draw(tmp)
+                bb = font.getbbox(ch)
+                ox = (width - (bb[2]-bb[0])) // 2 - bb[0]
+                oy = (height - (bb[3]-bb[1])) // 2 - bb[1]
+                d.text((ox, oy), ch, font=font, fill=255)
+                img = tmp.crop((0, 0, width, height))
+                px = img.load()
+                out = bytearray(bytes_per_glyph)
+                bpr = (width + 1) // 2
+                for y in range(height):
+                    for xb in range(bpr):
+                        lo = min(3, px[xb*2, y]*3//255)
+                        hi = min(3, px[xb*2+1, y]*3//255) if xb*2+1 < width else 0
+                        out[y*bpr+xb] = (lo & 0xF) | ((hi & 0xF) << 4)
+                return bytes(out)
+
+            for i, ch in enumerate(need):
+                sj, gi = free[i]
+                host_map[ch] = sj
+                rom[gbase + gi*bytes_per_glyph: gbase + (gi+1)*bytes_per_glyph] = render_glyph(ch)
+                glyphs_new += 1
+
+        def enc_unit(kind, u):
+            """단위 1개 인코드 — 토큰은 바이트 그대로, 문자는 host_map/cp932."""
+            return u["bytes"] if kind == "tok" else _tp_encode(u, host_map, [])
 
         done = trimmed = truncated = skipped = 0
+        item_errors, warnings, checked = [], [], []
         for it in items:
             ko = it.get("ko", "")
             if not ko:
                 skipped += 1
                 continue
             off, budget = it["file_off"], it["budget"]
-            e = enc(ko)
-            if len(e) > budget:
-                e = enc(ko.replace(" ", ""))
-                if len(e) <= budget:
-                    trimmed += 1
-                else:
-                    cut = bytearray()
-                    for ch in ko.replace(" ", ""):
-                        ce = enc(ch)
-                        if len(cut) + len(ce) > budget:
-                            break
-                        cut += ce
-                    e = bytes(cut)
-                    truncated += 1
-            rom[off:off+len(e)] = e
-            for k in range(off+len(e), off+budget):
-                rom[k] = pad
-            done += 1
+            # 예산 → 윈도우(종단자 포함 총 바이트) 정규화
+            window = budget if budget_includes_terminator else budget + 1
+            cap = _tp_safe_capacity(orig_rom, off, term)
+            if window > cap:
+                warnings.append({"off": f"0x{off:X}",
+                                 "warn": f"예산 클램프 {window}→{cap} — 원본 필드 실용량 초과 "
+                                         "(호출자 byte_len 오류 가능성)"})
+                window = cap
+            content_cap = window - 1 if reserve_terminator else window
+            if window < 1 or content_cap < 0:
+                item_errors.append({"off": f"0x{off:X}",
+                                    "error": "종단자조차 넣을 공간 없음 — 기록 안 함"})
+                continue
 
+            units = _tp_units(ko, tokens)
+            e = b"".join(enc_unit(k, u) for k, u in units)
+            was_trim = was_trunc = False
+            if len(e) > content_cap:
+                # 1차: 공백 단위만 제거 (토큰·문자 경계 유지)
+                nos = [(k, u) for k, u in units if not (k == "ch" and u == " ")]
+                e2 = b"".join(enc_unit(k, u) for k, u in nos)
+                if len(e2) <= content_cap:
+                    units, e, was_trim = nos, e2, True
+                else:
+                    # 2차: 단위 경계 절단 — 토큰·2바이트 쌍은 통째로만 남기거나 버린다
+                    cut, acc = [], 0
+                    for k, u in nos:
+                        ue = enc_unit(k, u)
+                        if acc + len(ue) > content_cap:
+                            break
+                        cut.append((k, u))
+                        acc += len(ue)
+                    units = cut
+                    e = b"".join(enc_unit(k, u) for k, u in units)
+                    was_trunc = True
+            # reserve_terminator=False로 내용이 윈도우를 꽉 채우면, 원본에서
+            # off+window가 종단자일 때만 그 자리에 종단자를 다시 쓴다.
+            # 아니면 종단자 공간 확보를 위해 추가 절단한다.
+            if not reserve_terminator and len(e) == window:
+                nxt = orig_rom[off + window] if off + window < len(orig_rom) else None
+                if nxt != term:
+                    while units and len(e) >= window:
+                        units = units[:-1]
+                        e = b"".join(enc_unit(k, u) for k, u in units)
+                    was_trunc = True
+                    warnings.append({"off": f"0x{off:X}",
+                                     "warn": "reserve_terminator=False지만 종단자 공간 확보 위해 추가 절단"})
+            final_text = "".join(u["text"] if k == "tok" else u for k, u in units)
+
+            rom[off:off + len(e)] = e
+            # 종단자 불변식 — 내용 직후 반드시 1바이트 기록
+            if off + len(e) < len(rom):
+                rom[off + len(e)] = term
+            for kk in range(off + len(e) + 1, off + window):
+                rom[kk] = pad
+            trimmed += was_trim
+            truncated += was_trunc
+            done += 1
+            checked.append({"off": off, "window": max(window, len(e) + 1),
+                            "intended": final_text, "allow_prefix": False})
+
+        # 게이트 T1~T5 — 실패 시 out 미기록, .rejected 격리
+        rev_map = {v: k for k, v in host_map.items()}
+        gate_res = _tp_verify_injection(bytes(rom), checked, rev_map, tokens, term)
         op = Path(out_path) if out_path else Path(rom_path)
+        result = {
+            "injected": done, "skipped_no_ko": skipped, "space_trimmed": trimmed,
+            "truncated": truncated, "rejected_items": item_errors,
+            "warnings": warnings, "new_glyphs": glyphs_new,
+            "verdict": gate_res["verdict"], "gates": gate_res["gates"],
+        }
+        if gate_res["verdict"] != "pass":
+            qp = Path(str(op) + ".rejected")
+            qp.write_bytes(bytes(rom))
+            result.update({
+                "out": None, "quarantined": str(qp),
+                "next_action": "게이트 실패 — out/host_map 미기록. gates의 실패 항목"
+                               "(offset·intended vs decoded)을 보고 items/budget을 수정 후 재주입.",
+            })
+            return json.dumps(result, ensure_ascii=False, indent=1)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if op.exists():
             shutil.copy2(op, f"{op}.bak-{ts}")
         op.write_bytes(bytes(rom))
         hm_path.write_text(json.dumps(host_map, ensure_ascii=False), encoding="utf-8")
-        return json.dumps({
-            "injected": done, "skipped_no_ko": skipped, "space_trimmed": trimmed,
-            "truncated": truncated, "new_glyphs": glyphs_new, "out": str(op),
+        result.update({
+            "out": str(op),
             "next_action": "에뮬(emucap launch→tap→screenshot)로 해당 장면을 열어 "
                            "화면 실측 검증. 깨지면 diagnose_glyph_shift 실행.",
+        })
+        return json.dumps(result, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def verify_injection(rom_path: str, items_json: str, host_map_json: str,
+                     terminator: str = "0x00",
+                     budget_includes_terminator: bool = True,
+                     ctrl_tokens: str = "", tokens_path: str = "") -> str:
+    """기존(주입된) ROM에 대한 T1~T5 정합성 게이트 독립 실행 — 쓰기 없음.
+
+    inject_budgeted_text가 자동 수행하는 게이트의 사후 검증판. 이미 배포된
+    패치롬에서 종단자 소실·병합·토큰 손실을 재감사할 때 사용.
+    items_json: [{file_off, budget, ko}] — ko를 '의도 텍스트'로 간주하며
+    정당한 절단(접두 일치, 공백 제거 포함)은 실패로 치지 않는다.
+    게이트: T1 terminator_guard / T2 decode_back / T3 boundary_integrity /
+    T4 no_merge / T5 ctrl_token_guard.
+    """
+    try:
+        rom = _read_rom(rom_path)
+        host_map = {k: int(v) for k, v in
+                    json.loads(Path(host_map_json).read_text(encoding="utf-8")).items()}
+        items = json.loads(Path(items_json).read_text(encoding="utf-8"))
+        tokens = _tp_load_tokens(ctrl_tokens, tokens_path, rom_path)
+        term = int(terminator, 0)
+        checked = []
+        for it in items:
+            ko = it.get("ko", "")
+            if not ko:
+                continue
+            budget = it["budget"]
+            window = budget if budget_includes_terminator else budget + 1
+            checked.append({"off": it["file_off"], "window": window,
+                            "intended": ko, "allow_prefix": True})
+        rev_map = {v: k for k, v in host_map.items()}
+        res = _tp_verify_injection(rom, checked, rev_map, tokens, term)
+        res["items_checked"] = len(checked)
+        res["next_action"] = ("전 게이트 통과 — 에뮬 실측 검증으로 진행."
+                              if res["verdict"] == "pass" else
+                              "실패 게이트의 off를 coverage_gap_scan merged와 대조해 "
+                              "원인 항목을 특정, inject_budgeted_text로 재주입.")
+        return json.dumps(res, ensure_ascii=False, indent=1)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def glyph_slot_audit(rom_path: str, table_offset: str, table_entries: int,
+                     glyph_slots_used: str, region_start: str = "",
+                     region_end: str = "", strings_json: str = "",
+                     ctrl_tokens: str = "", tokens_path: str = "") -> str:
+    """글리프 슬롯 탈취 충돌 감사 — 한글 비트맵으로 덮어쓴 host 슬롯을
+    아직 참조하는 잔존 문자열/제어 토큰/원시 바이트를 전수 색출.
+
+    glyph_slots_used: JSON 배열(파일 경로 또는 인라인) — glyph_idx(int) 또는
+    SJIS 코드("0x88EE" 등 문자열) 혼용 가능.
+    검출 3종:
+    (a) 등록 제어 토큰이 탈취 슬롯과 충돌 (kind=ctrl_token)
+    (b) 잔존(미번역/유지) 문자열이 탈취 슬롯의 SJIS 코드를 참조 (kind=string_ref)
+        → 화면에 엉뚱한 한글 글리프로 렌더된다
+    (c) 알려진 문자열 영역 밖의 원시 참조 (kind=raw_ref) — 이름 버퍼/템플릿
+        후보. 오프셋 + 주변 16바이트 hex 컨텍스트 포함.
+        ("이름이 4=0으로 렌더" 가설의 직접 탐침 — 탈취된 한자 슬롯을
+        참조하는 이름 템플릿을 이걸로 찾는다.)
+    strings_json 미지정 시 region 범위의 null-종단 세그먼트를 자동 수집.
+    """
+    import bisect as _bisect
+    try:
+        rom = _read_rom(rom_path)
+        toff = int(table_offset, 0)
+        entries = _fv_read_table(rom, toff, table_entries)
+        gi2sjis = {gi: c for c, gi in entries}
+        sjis2gi = {c: gi for c, gi in entries}
+
+        # 입력 정규화 — glyph_idx(int) → SJIS, "0x…"(str) → SJIS
+        p = Path(glyph_slots_used)
+        raw = (json.loads(p.read_text(encoding="utf-8"))
+               if len(glyph_slots_used) < 4096 and p.exists()
+               else json.loads(glyph_slots_used))
+        stolen, unresolved = set(), []
+        for v in raw:
+            if isinstance(v, str):
+                stolen.add(int(v, 0))
+            elif isinstance(v, int):
+                if v in gi2sjis:
+                    stolen.add(gi2sjis[v])
+                else:
+                    unresolved.append(v)
+
+        tokens = _tp_load_tokens(ctrl_tokens, tokens_path, rom_path)
+        collisions = []
+
+        def _gi(code):
+            return sjis2gi.get(code)
+
+        # (a) 제어 토큰 충돌
+        for t in tokens:
+            b = t["bytes"]
+            code = (b[0] << 8) | b[1] if len(b) == 2 else b[0]
+            if code in stolen:
+                collisions.append({"kind": "ctrl_token",
+                                   "sjis_code": f"0x{code:04X}", "glyph_idx": _gi(code),
+                                   "where": f"token:{t['name']}",
+                                   "context": b.hex(" ")})
+
+        # 문자열 영역 수집 — strings_json 우선, 없으면 범위 자동 세그먼트화
+        rs = int(region_start, 0) if region_start else 0
+        re_ = int(region_end, 0) if region_end else len(rom)
+        segs = []
+        if strings_json:
+            sp = Path(strings_json)
+            sdata = (json.loads(sp.read_text(encoding="utf-8"))
+                     if len(strings_json) < 4096 and sp.exists()
+                     else json.loads(strings_json))
+            if isinstance(sdata, dict):  # {"strings": [...]} 래퍼 수용
+                sdata = sdata.get("strings", sdata.get("items", []))
+            for s in sdata:
+                st = s.get("file_off", s.get("offset_dec"))
+                ln = s.get("byte_len_with_null",
+                           s.get("byte_len", s.get("length", 0)))
+                if st is not None and ln:
+                    # 번역된(ko 보유) 세그먼트는 도난 슬롯의 의도적 사용자 —
+                    # 잔존 참조 감사 대상은 미번역 세그먼트만
+                    segs.append((int(st), int(st) + int(ln),
+                                 bool(s.get("ko"))))
+        else:
+            i = rs
+            while i < re_:
+                if rom[i] == 0:
+                    i += 1
+                    continue
+                st = i
+                while i < re_ and rom[i] != 0:
+                    i += 1
+                # 자동 세그먼트화 모드는 번역 여부를 모름 → 전부 감사 대상
+                segs.append((st, i, False))
+        segs.sort()
+        seg_starts = [s[0] for s in segs]
+
+        def _in_seg(o):
+            """오프셋 o가 알려진 문자열 세그먼트 내부인지 (bisect)."""
+            k = _bisect.bisect_right(seg_starts, o) - 1
+            return k >= 0 and segs[k][0] <= o < segs[k][1]
+
+        # (b) 문자열 내 잔존 참조 — SJIS 2바이트 워크.
+        # 번역된(translated=True) 세그먼트는 도난 코드가 곧 한글이므로 제외.
+        MAX_PER_KIND = 500  # kind별 독립 캡 — 한쪽 폭주가 다른 kind를 가리지 않게
+        n_string_ref = 0
+        for st, en, translated in segs:
+            if translated:
+                continue
+            j = st
+            while j < en and n_string_ref < MAX_PER_KIND:
+                b0 = rom[j]
+                if _tp_is_lead(b0) and j + 1 < en:
+                    code = (b0 << 8) | rom[j + 1]
+                    if code in stolen:
+                        collisions.append({
+                            "kind": "string_ref",
+                            "sjis_code": f"0x{code:04X}", "glyph_idx": _gi(code),
+                            "where": f"string@0x{st:X}+{j - st}",
+                            "offset": f"0x{j:X}",
+                            "context": rom[max(0, j - 8):j + 8].hex(" ")})
+                        n_string_ref += 1
+                    j += 2
+                else:
+                    j += 1
+
+        # (c) 문자열 밖 원시 참조 — 이름 버퍼/템플릿 후보 (kind별 독립 캡)
+        n_raw_ref = 0
+        for code in sorted(c for c in stolen if c > 0xFF):
+            pat = bytes([code >> 8, code & 0xFF])
+            k = rom.find(pat, rs)
+            while k != -1 and k < re_:
+                if not _in_seg(k):
+                    collisions.append({
+                        "kind": "raw_ref",
+                        "sjis_code": f"0x{code:04X}", "glyph_idx": _gi(code),
+                        "where": "outside_strings",
+                        "offset": f"0x{k:X}",
+                        "context": rom[max(0, k - 8):k + 8].hex(" ")})
+                    n_raw_ref += 1
+                    if n_raw_ref >= MAX_PER_KIND:
+                        break
+                k = rom.find(pat, k + 1)
+            if n_raw_ref >= MAX_PER_KIND:
+                break
+
+        return json.dumps({
+            "stolen_slots": len(stolen),
+            "unresolved_glyph_idx": unresolved,
+            "segments_scanned": len(segs),
+            "collision_count": len(collisions),
+            "collisions": collisions[:200],
+            "next_action": "collision 0건이면 슬롯 탈취 안전. string_ref는 해당 문자열을 "
+                           "번역/재주입하거나 다른 슬롯으로 재배치. raw_ref는 이름 템플릿/"
+                           "버퍼 후보 — emucap으로 해당 오프셋 참조 시점을 라이브 확인.",
         }, ensure_ascii=False, indent=1)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
