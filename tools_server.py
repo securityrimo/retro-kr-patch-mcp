@@ -23,7 +23,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-OUTPUT_DIR = Path("/root/projects/retro-kr-patch-mcp/output")
+REPO_ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(os.environ.get("KRPATCH_OUTPUT_DIR", str(REPO_ROOT / "output")))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 _INSTRUCTIONS = """레트로 한글화 도구 서버 — 스캔/번역/인젝션/검증/그래픽 파이프라인.
@@ -722,7 +723,7 @@ def dump_font_tiles(rom_path: str, offset: str, bpp: int = 2,
             "tile_size": f"{tile_width}x{tile_height}",
             "bpp": bpp,
             "data_size": len(tile_raw),
-            "preview_url": f"http://172.30.1.78:8093/files/{png_path.name}" if png_data else None,
+            "preview_url": f"{os.environ.get('KRPATCH_PREVIEW_HOST', 'http://127.0.0.1:8093')}/files/{png_path.name}" if png_data else None,
         }, ensure_ascii=False, indent=2)
     else:
         # pillow 없는 경우 헥스 덤프만
@@ -1435,10 +1436,10 @@ def project_init(project_name: str, platform: str, base_dir: str = "") -> str:
 
     project-conventions.md 표준 레이아웃으로 디렉토리 구조 생성.
     platform: snes|megadrive|saturn|ps1|dreamcast|pce|pc98|gg|nds
-    base_dir: 프로젝트 루트 경로 (기본: /mnt/synology_devdata/projects/)
+    base_dir: 프로젝트 루트 경로 (기본: KRPATCH_PROJECTS_DIR env, 없으면 ./projects)
     """
     if not base_dir:
-        base_dir = "/mnt/synology_devdata/projects"
+        base_dir = os.environ.get("KRPATCH_PROJECTS_DIR", "./projects")
 
     root = Path(base_dir) / project_name
     if root.exists():
@@ -1527,8 +1528,9 @@ __pycache__/
 
 @mcp.tool()
 def review_dashboard(project_dir: str, action: str = "start",
-                     port: int = 0, bind: str = "0.0.0.0") -> str:
-    """번역 검수 대시보드를 프로젝트별로 기동/중지/상태확인 (내부 IP, ROM 무관).
+                     port: int = 0, bind: str = "127.0.0.1") -> str:
+    """번역 검수 대시보드를 프로젝트별로 기동/중지/상태확인 (로컬 전용, 인증 없음, ROM 무관).
+    LAN 등에 노출하려면 bind를 명시적으로 바꾸되 인증 부재를 인지할 것.
 
     활성 세션의 프로젝트 루트를 넘기면 그 프로젝트의 `krpatch.dashboard.json`
     설정대로 Flask 대시보드를 띄운다(없으면 관례로 자동생성). 원문↔번역 대조,
@@ -1547,7 +1549,7 @@ def review_dashboard(project_dir: str, action: str = "start",
     import sys
     import time
 
-    dash = "/root/projects/retro-kr-patch-mcp/dashboard/app.py"
+    dash = str(REPO_ROOT / "dashboard" / "app.py")
     root = Path(project_dir).resolve()
     if not root.is_dir():
         return json.dumps({"ok": False, "err": f"디렉토리 아님: {root}"}, ensure_ascii=False)
@@ -1670,7 +1672,7 @@ def translate_pipeline(project_dir: str, action: str = "run",
     import sys
     import time
 
-    tp = "/root/projects/retro-kr-patch-mcp/dashboard/translate.py"
+    tp = str(REPO_ROOT / "dashboard" / "translate.py")
     root = Path(project_dir).resolve()
     if not root.is_dir():
         return json.dumps({"ok": False, "err": f"디렉토리 아님: {root}"}, ensure_ascii=False)

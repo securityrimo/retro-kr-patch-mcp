@@ -19,11 +19,14 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 # ── 경로 ──────────────────────────────────────────────────────────────────────
-SKILL_ROOT = Path("/mnt/synology_devdata/create-retro-game-kr-patch/skills/create-kr-patch")
+# 기본은 리포에 내장된 knowledge/ (자체완결, 다른 호스트에서도 그대로 동작).
+# KRPATCH_SKILL_ROOT 환경변수로 외부 스킬 디렉토리를 대신 가리킬 수 있음(사설 확장용).
+REPO_ROOT = Path(__file__).resolve().parent
+SKILL_ROOT = Path(os.environ.get("KRPATCH_SKILL_ROOT", str(REPO_ROOT / "knowledge")))
 STRATEGY_DIR = SKILL_ROOT / "references" / "strategy"
 PLATFORMS_DIR = SKILL_ROOT / "references" / "platforms"
 SKILL_MD = SKILL_ROOT / "SKILL.md"
-CHECKPOINT_DIR = Path("/root/projects/retro-kr-patch-mcp/checkpoints")
+CHECKPOINT_DIR = Path(os.environ.get("KRPATCH_CHECKPOINT_DIR", str(REPO_ROOT / "checkpoints")))
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 mcp = FastMCP("retro-kr-patch-knowledge")

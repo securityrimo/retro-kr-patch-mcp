@@ -1,13 +1,13 @@
 # 번역 검수 대시보드 (ROM 무관)
 
 레트로 한글패치의 번역을 **원문↔번역 좌우 대조 + 스토리(대본)순**으로 사람이
-직접 검수·수정하는 내부 IP Flask 대시보드. `retro-kr-patch-tools` MCP의
+직접 검수·수정하는 로컬 전용 Flask 대시보드. `retro-kr-patch-tools` MCP의
 `review_dashboard` 도구로 **활성 프로젝트별로** 기동한다.
 
 ## 사용
 ```
 review_dashboard(project_dir="/…/my-rom-project", action="start")
-→ {"ok":true,"url":"http://172.30.1.78:PORT", ...}
+→ {"ok":true,"url":"http://127.0.0.1:PORT", ...}
 ```
 - action: `start` | `stop` | `status` | `restart`
 - 프로세스는 프로젝트 `.krpatch/dashboard.pid` 로 **자기소유만** 관리(광역 kill 없음)

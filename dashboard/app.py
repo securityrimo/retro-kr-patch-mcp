@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""레트로 한글패치 번역 검수 대시보드 (Flask, 내부 IP) — ROM/프로젝트 무관.
+"""레트로 한글패치 번역 검수 대시보드 (Flask, 로컬 전용) — ROM/프로젝트 무관.
 
 `PROJECT_DIR` 환경변수의 프로젝트를 `krpatch.dashboard.json` 설정대로 연다.
 - 원문 ↔ 한글 좌우 대조, 코덱 있으면 실제 글리프 미리보기 + 바이트예산 게이지
@@ -328,5 +328,6 @@ def api_rebuild():
 
 if __name__ == '__main__':
     port = int(os.environ.get('DASH_PORT') or CFG.get('port', 5057))
-    host = os.environ.get('FLASK_RUN_HOST', '0.0.0.0')
+    # 인증 없는 로컬 검수용 서버 — 기본은 localhost만. LAN 노출은 명시적 opt-in.
+    host = os.environ.get('FLASK_RUN_HOST', '127.0.0.1')
     app.run(host=host, port=port)
