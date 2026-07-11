@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 SKILL_ROOT = Path(os.environ.get("KRPATCH_SKILL_ROOT", str(REPO_ROOT / "knowledge")))
 STRATEGY_DIR = SKILL_ROOT / "references" / "strategy"
 PLATFORMS_DIR = SKILL_ROOT / "references" / "platforms"
+CONVENTIONS_DIR = SKILL_ROOT / "references" / "conventions"
+TIPS_DIR = SKILL_ROOT / "references" / "tips"
 SKILL_MD = SKILL_ROOT / "SKILL.md"
 CHECKPOINT_DIR = Path(os.environ.get("KRPATCH_CHECKPOINT_DIR", str(REPO_ROOT / "checkpoints")))
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,6 +55,16 @@ def _list_platform_docs() -> dict[str, str]:
     """platforms 디렉토리의 모든 문서 목록 (이름 → 첫 줄)"""
     docs = {}
     for f in sorted(PLATFORMS_DIR.glob("*.md")):
+        content = f.read_text(encoding="utf-8")
+        first_line = content.strip().split("\n")[0].lstrip("#").strip()
+        docs[f.stem] = first_line
+    return docs
+
+
+def _list_dir_docs(directory: Path) -> dict[str, str]:
+    """임의 디렉토리의 모든 문서 목록 (이름 → 첫 줄)"""
+    docs = {}
+    for f in sorted(directory.glob("*.md")):
         content = f.read_text(encoding="utf-8")
         first_line = content.strip().split("\n")[0].lstrip("#").strip()
         docs[f.stem] = first_line
@@ -129,6 +141,51 @@ def get_platform_doc(name: str) -> str:
     return content
 
 
+# ── 리소스: conventions 문서 (시행 컨벤션) ────────────────────────────────────
+@mcp.resource("conventions://list")
+def get_conventions_list() -> str:
+    """시행 컨벤션 문서 목록 (이름 + 설명)"""
+    docs = _list_dir_docs(CONVENTIONS_DIR)
+    lines = ["# Convention Documents", ""]
+    for name, desc in docs.items():
+        lines.append(f"- **{name}**: {desc}")
+    return "\n".join(lines)
+
+
+@mcp.resource("conventions://{name}")
+def get_conventions_doc(name: str) -> str:
+    """특정 시행 컨벤션 문서 전체 내용"""
+    path = CONVENTIONS_DIR / f"{name}.md"
+    content = _read_md(path)
+    if content is None:
+        return json.dumps({"error": f"conventions 문서 없음: {name}", "available": list(_list_dir_docs(CONVENTIONS_DIR).keys())}, ensure_ascii=False)
+    return content
+
+
+# ── 리소스: tips 문서 (검증된 국소 사례) ─────────────────────────────────────
+@mcp.resource("tips://list")
+def get_tips_list() -> str:
+    """검증된 국소 사례 색인 — README의 발동 조건별 앵커 표 (전부 읽지 말고 조건에 맞는 앵커만 선택)"""
+    content = _read_md(TIPS_DIR / "README.md")
+    if content:
+        return content
+    docs = _list_dir_docs(TIPS_DIR)
+    lines = ["# Tips Documents", ""]
+    for name, desc in docs.items():
+        lines.append(f"- **{name}**: {desc}")
+    return "\n".join(lines)
+
+
+@mcp.resource("tips://{name}")
+def get_tips_doc(name: str) -> str:
+    """특정 tips 사례 문서 전체 내용 (general 또는 플랫폼명)"""
+    path = TIPS_DIR / f"{name}.md"
+    content = _read_md(path)
+    if content is None:
+        return json.dumps({"error": f"tips 문서 없음: {name}", "available": list(_list_dir_docs(TIPS_DIR).keys())}, ensure_ascii=False)
+    return content
+
+
 # ── 툴: 지식 검색 ────────────────────────────────────────────────────────────
 def _search_in_docs(query: str) -> list[dict]:
     """모든 문서에서 쿼리 검색"""
@@ -148,6 +205,14 @@ def _search_in_docs(query: str) -> list[dict]:
     # Platform docs
     for f in sorted(PLATFORMS_DIR.glob("*.md")):
         all_docs.append((f"platforms://{f.stem}", f"platforms/{f.name}", f.read_text(encoding="utf-8")))
+
+    # Convention docs
+    for f in sorted(CONVENTIONS_DIR.glob("*.md")):
+        all_docs.append((f"conventions://{f.stem}", f"conventions/{f.name}", f.read_text(encoding="utf-8")))
+
+    # Tips docs (검증된 국소 사례)
+    for f in sorted(TIPS_DIR.glob("*.md")):
+        all_docs.append((f"tips://{f.stem}", f"tips/{f.name}", f.read_text(encoding="utf-8")))
 
     # 검색: 제목 + 본문 청크
     for uri, label, content in all_docs:
@@ -170,9 +235,9 @@ def _search_in_docs(query: str) -> list[dict]:
 
 @mcp.tool()
 def search_knowledge(query: str) -> str:
-    """모든 strategy·platform 문서에서 키워드 검색. URI, 줄번호, 컨텍스트 반환.
+    """모든 strategy·platform·conventions·tips 문서에서 키워드 검색. URI, 줄번호, 컨텍스트 반환.
 
-    검색 대상: SKILL.md + strategy/ 12종 + platforms/ 9종.
+    검색 대상: SKILL.md + strategy/ + platforms/ + conventions/ + tips/(검증 사례).
     용례: "포인터 테이블 검색 방법", "SNES 체크섬 재계산", "완성형 vs 조합형"
     """
     if not query.strip():
@@ -206,31 +271,33 @@ def search_knowledge(query: str) -> str:
 def get_workflow_step(step: str) -> str:
     """특정 파이프라인 단계에 해당하는 모든 관련 문서를 모아 반환.
 
-    step: survey|font|extract|poc|reinsert|translate|build|debug|graphics|compression|conventions|tips
+    step: survey|font|extract|poc|reinsert|translate|build|debug|graphics|compression|runtime|conventions|tips
     """
     step_map = {
-        "survey": "initial-survey",
-        "font": "font-strategy",
-        "extract": "text-extraction",
-        "poc": "poc",
-        "reinsert": "reinsertion",
-        "translate": "translation-workflow",
-        "build": "build-and-verify",
-        "debug": "debugging",
-        "graphics": "graphics-text",
-        "compression": "compression",
-        "conventions": "project-conventions",
-        "tips": "tips",
+        "survey": (STRATEGY_DIR, "initial-survey"),
+        "font": (STRATEGY_DIR, "font-strategy"),
+        "extract": (STRATEGY_DIR, "text-extraction"),
+        "poc": (STRATEGY_DIR, "poc"),
+        "reinsert": (STRATEGY_DIR, "reinsertion"),
+        "translate": (STRATEGY_DIR, "translation-workflow"),
+        "build": (STRATEGY_DIR, "build-and-verify"),
+        "debug": (STRATEGY_DIR, "debugging"),
+        "graphics": (STRATEGY_DIR, "graphics-text"),
+        "compression": (STRATEGY_DIR, "compression"),
+        "runtime": (STRATEGY_DIR, "runtime-assets"),
+        "conventions": (CONVENTIONS_DIR, "project-conventions"),
+        "tips": (TIPS_DIR, "README"),
     }
 
-    name = step_map.get(step.lower())
-    if not name:
+    entry = step_map.get(step.lower())
+    if not entry:
         return json.dumps({
             "error": f"알 수 없는 단계: {step}",
             "valid_steps": list(step_map.keys())
         }, ensure_ascii=False)
 
-    path = STRATEGY_DIR / f"{name}.md"
+    directory, name = entry
+    path = directory / f"{name}.md"
     content = _read_md(path)
     if not content:
         return json.dumps({"error": f"문서 없음: {name}"}, ensure_ascii=False)
